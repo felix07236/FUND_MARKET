@@ -318,6 +318,42 @@ def calc_monthly_metrics(fund_month, idx_month):
     return {"月超额胜率": win_rate, "进攻能力": attack}
 
 
+def _add_virtual_start_nav(prd_df_clean: pd.DataFrame, virtual_start_dt: pd.Timestamp) -> pd.DataFrame:
+    virtual_start_nav = pd.DataFrame({
+        "NAV_DT": [virtual_start_dt],
+        "AGGR_UNIT_NVAL": [1.0]
+    })
+    full_nav_series = pd.concat(
+        [virtual_start_nav, prd_df_clean[["NAV_DT", "AGGR_UNIT_NVAL"]]],
+        ignore_index=True
+    )
+    return full_nav_series.sort_values("NAV_DT").reset_index(drop=True)
+
+
+def _filter_complete_month_returns(month_df: pd.DataFrame, value_col: str, complete_months: list) -> pd.DataFrame:
+    month_df = month_df.copy()
+    if "上月末净值" not in month_df.columns:
+        month_df["上月末净值"] = month_df["月末净值"].shift(1)
+    month_df[value_col] = month_df["月末净值"] / month_df["上月末净值"] - 1
+
+    if len(month_df) >= 2 and complete_months:
+        months_to_keep = set(complete_months)
+        for month in complete_months:
+            months_to_keep.add(month - 1)
+        month_df = month_df[month_df["年月"].isin(months_to_keep)].reset_index(drop=True)
+
+    month_df["是否完整月"] = month_df["年月"].isin(complete_months) if complete_months else True
+    result = month_df[["年月", value_col, "是否完整月"]].dropna()
+    return result[result["是否完整月"]].drop(columns=["是否完整月"])
+
+
+def _get_idx_start_date_by_anchor(idx_df: pd.DataFrame, anchor_dt: pd.Timestamp) -> pd.Timestamp:
+    idx_before = idx_df[idx_df["NAV_DT"] <= anchor_dt]
+    if len(idx_before) == 0:
+        return idx_df["NAV_DT"].min()
+    return idx_before["NAV_DT"].max()
+
+
 # --------------------------------------------------
 # 5. 单产品指标计算
 # --------------------------------------------------
@@ -421,21 +457,9 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
             actual_end_dt_for_monthly = current_dt
 
         if period == "成立以来":
-            virtual_start_nav = pd.DataFrame({
-                "NAV_DT": [virtual_start_dt],
-                "AGGR_UNIT_NVAL": [1.0]
-            })
-            full_nav_series = pd.concat([virtual_start_nav, prd_df_clean[["NAV_DT", "AGGR_UNIT_NVAL"]]],
-                                        ignore_index=True)
-            full_nav_series = full_nav_series.sort_values("NAV_DT").reset_index(drop=True)
+            full_nav_series = _add_virtual_start_nav(prd_df_clean, virtual_start_dt)
         elif not has_start_data and theoretical_start_dt < fund_established_dt:
-            virtual_start_nav = pd.DataFrame({
-                "NAV_DT": [virtual_start_dt],
-                "AGGR_UNIT_NVAL": [1.0]
-            })
-            full_nav_series = pd.concat([virtual_start_nav, prd_df_clean[["NAV_DT", "AGGR_UNIT_NVAL"]]],
-                                        ignore_index=True)
-            full_nav_series = full_nav_series.sort_values("NAV_DT").reset_index(drop=True)
+            full_nav_series = _add_virtual_start_nav(prd_df_clean, virtual_start_dt)
         elif not has_start_data and theoretical_start_dt >= fund_established_dt:
             full_nav_series = prd_df_clean.copy()
             full_nav_series = full_nav_series.sort_values("NAV_DT").reset_index(drop=True)
@@ -452,7 +476,66 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
 
         full_nav_series["年月"] = full_nav_series["NAV_DT"].dt.to_period("M")
 
-        # 提取每月末净值（先不过滤足月，保留所有月份）
+        # ========== 足月逻辑：先标记哪些月份是完整月份 ==========
+        complete_months = []  # 初始化为空列表
+        
+        if len(full_nav_series) >= 1:
+            # 获取实际的数据起始日和结束日
+            actual_data_start = full_nav_series["NAV_DT"].min()
+            actual_data_end = full_nav_series["NAV_DT"].max()
+
+            # 提取所有月份
+            all_months = full_nav_series["年月"].unique()
+            
+            # 标记每个月是否完整
+            for month_period in all_months:
+                is_complete = True
+                
+                # 检查起始月是否完整
+                if month_period == actual_data_start.to_period("M"):
+                    if day_type == "交易日" and trading_days_df is not None:
+                        # 交易日模式：获取该月的所有交易日
+                        trading_dates_in_start_month = trading_days_df[
+                            (trading_days_df["IS_TRD_DT"] == True) &
+                            (trading_days_df["CALD_DATE"].dt.to_period("M") == month_period)
+                            ]["CALD_DATE"]
+
+                        if len(trading_dates_in_start_month) > 0:
+                            # 该月第一个交易日
+                            first_trading_day_of_month = trading_dates_in_start_month.min()
+                            # 如果实际数据起始日晚于该月第一个交易日，说明起始月不完整
+                            if actual_data_start > first_trading_day_of_month:
+                                is_complete = False
+                    else:
+                        # 自然日模式：如果起始日不是该月1号，则不完整
+                        if actual_data_start.day != 1:
+                            is_complete = False
+                
+                # 检查结束月是否完整
+                if month_period == actual_data_end.to_period("M"):
+                    if day_type == "交易日" and trading_days_df is not None:
+                        # 交易日模式：获取该月的所有交易日
+                        trading_dates_in_end_month = trading_days_df[
+                            (trading_days_df["IS_TRD_DT"] == True) &
+                            (trading_days_df["CALD_DATE"].dt.to_period("M") == month_period)
+                            ]["CALD_DATE"]
+
+                        if len(trading_dates_in_end_month) > 0:
+                            # 该月最后一个交易日
+                            last_trading_day_of_month = trading_dates_in_end_month.max()
+                            # 如果实际数据结束日早于该月最后一个交易日，说明结束月不完整
+                            if actual_data_end < last_trading_day_of_month:
+                                is_complete = False
+                    else:
+                        # 自然日模式：如果结束日不是该月最后一天，则不完整
+                        end_month_last_day = (actual_data_end + pd.offsets.MonthEnd(0))
+                        if actual_data_end.day != end_month_last_day.day:
+                            is_complete = False
+                
+                if is_complete:
+                    complete_months.append(month_period)
+
+        # 提取每月末净值（保留所有月份用于计算）
         month_end_nav = (
             full_nav_series.groupby("年月")["AGGR_UNIT_NVAL"]
             .last()
@@ -461,113 +544,21 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
 
         # 计算月收益：本月末净值 / 上月末净值 - 1
         month_end_nav["上月末净值"] = month_end_nav["月末净值"].shift(1)
-        month_end_nav["月收益"] = month_end_nav["月末净值"] / month_end_nav["上月末净值"] - 1
-
-        # ========== 足月逻辑：在计算月收益后，过滤不完整月份 ==========
-        if len(month_end_nav) >= 2:
-            # 获取实际的数据起始日和结束日
-            actual_data_start = full_nav_series["NAV_DT"].min()
-            actual_data_end = full_nav_series["NAV_DT"].max()
-
-            # 标记哪些月份是完整月份
-            month_end_nav["是否完整月"] = True
-
-            # 检查起始月是否完整
-            start_month_period = actual_data_start.to_period("M")
-
-            if day_type == "交易日" and trading_days_df is not None:
-                # 交易日模式：获取该月的所有交易日
-                trading_dates_in_start_month = trading_days_df[
-                    (trading_days_df["IS_TRD_DT"] == True) &
-                    (trading_days_df["CALD_DATE"].dt.to_period("M") == start_month_period)
-                    ]["CALD_DATE"]
-
-                if len(trading_dates_in_start_month) > 0:
-                    # 该月第一个交易日
-                    first_trading_day_of_month = trading_dates_in_start_month.min()
-
-                    # 如果实际数据起始日晚于该月第一个交易日，说明起始月不完整
-                    if actual_data_start > first_trading_day_of_month:
-                        mask_start = month_end_nav["年月"] == start_month_period
-                        month_end_nav.loc[mask_start, "是否完整月"] = False
-            else:
-                # 自然日模式：如果起始日不是该月1号，则不完整
-                if actual_data_start.day != 1:
-                    mask_start = month_end_nav["年月"] == start_month_period
-                    month_end_nav.loc[mask_start, "是否完整月"] = False
-
-            # 检查结束月是否完整
-            end_month_period = actual_data_end.to_period("M")
-
-            if day_type == "交易日" and trading_days_df is not None:
-                # 交易日模式：获取该月的所有交易日
-                trading_dates_in_end_month = trading_days_df[
-                    (trading_days_df["IS_TRD_DT"] == True) &
-                    (trading_days_df["CALD_DATE"].dt.to_period("M") == end_month_period)
-                    ]["CALD_DATE"]
-
-                if len(trading_dates_in_end_month) > 0:
-                    # 该月最后一个交易日
-                    last_trading_day_of_month = trading_dates_in_end_month.max()
-
-                    # 如果实际数据结束日早于该月最后一个交易日，说明结束月不完整
-                    if actual_data_end < last_trading_day_of_month:
-                        mask_end = month_end_nav["年月"] == end_month_period
-                        month_end_nav.loc[mask_end, "是否完整月"] = False
-            else:
-                # 自然日模式：如果结束日不是该月最后一天，则不完整
-                end_month_last_day = (actual_data_end + pd.offsets.MonthEnd(0))
-                if actual_data_end.day != end_month_last_day.day:
-                    mask_end = month_end_nav["年月"] == end_month_period
-                    month_end_nav.loc[mask_end, "是否完整月"] = False
-
-            # 删除不完整月份的月收益数据
-            month_end_nav = month_end_nav[month_end_nav["是否完整月"]].drop(columns=["是否完整月"]).reset_index(
-                drop=True)
-
-        # 最后删除NaN（第一个月因为没有上月数据）
-        fund_month = month_end_nav[["年月", "月收益"]].dropna()
+        # 今年以来场景下，若缺少上一年12月数据，首月（通常为1月）改用区间起始净值作为基准
+        if period == "今年以来" and len(month_end_nav) > 0:
+            first_idx = month_end_nav.index[0]
+            if pd.isna(month_end_nav.loc[first_idx, "上月末净值"]) and pd.notna(nav_start) and nav_start > 0:
+                month_end_nav.loc[first_idx, "上月末净值"] = nav_start
+        fund_month = _filter_complete_month_returns(month_end_nav, "月收益", complete_months)
 
         fund_daily_ret = full_nav_series.set_index("NAV_DT")["AGGR_UNIT_NVAL"].pct_change().dropna()
 
-        if period == "成立以来":
-            target_dt = fund_established_dt - pd.Timedelta(days=1)
-            idx_before = idx_df[idx_df["NAV_DT"] <= target_dt]
-
-            if len(idx_before) == 0:
-                idx_start_date = idx_df["NAV_DT"].min()
-            else:
-                idx_start_date = idx_before["NAV_DT"].max()
-
-            idx_end_date = actual_end_dt_for_monthly
-        elif not has_start_data and theoretical_start_dt < fund_established_dt:
-            target_dt = fund_established_dt - pd.Timedelta(days=1)
-            idx_before = idx_df[idx_df["NAV_DT"] <= target_dt]
-
-            if len(idx_before) == 0:
-                idx_start_date = idx_df["NAV_DT"].min()
-            else:
-                idx_start_date = idx_before["NAV_DT"].max()
-
-            idx_end_date = actual_end_dt_for_monthly
-        elif not has_start_data and theoretical_start_dt >= fund_established_dt:
-            idx_before = idx_df[idx_df["NAV_DT"] <= actual_start_dt]
-
-            if len(idx_before) == 0:
-                idx_start_date = idx_df["NAV_DT"].min()
-            else:
-                idx_start_date = idx_before["NAV_DT"].max()
-
-            idx_end_date = actual_end_dt_for_monthly
+        if period == "成立以来" or (not has_start_data and theoretical_start_dt < fund_established_dt):
+            idx_anchor_dt = fund_established_dt - pd.Timedelta(days=1)
         else:
-            idx_before = idx_df[idx_df["NAV_DT"] <= actual_start_dt]
-
-            if len(idx_before) == 0:
-                idx_start_date = idx_df["NAV_DT"].min()
-            else:
-                idx_start_date = idx_before["NAV_DT"].max()
-
-            idx_end_date = actual_end_dt_for_monthly
+            idx_anchor_dt = actual_start_dt
+        idx_start_date = _get_idx_start_date_by_anchor(idx_df, idx_anchor_dt)
+        idx_end_date = actual_end_dt_for_monthly
 
         idx_sub = idx_df[
             (idx_df["NAV_DT"] >= idx_start_date) &
@@ -605,7 +596,7 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
                     (idx_sub_copy["NAV_DT"].dt.to_period("M") <= fund_end_month)
                     ].reset_index(drop=True)
 
-        # 提取指数每月末净值
+        # 提取指数每月末净值（保留所有月份用于计算）
         idx_month_end = (
             idx_sub_copy.groupby("年月")["INDEX_CLOSE"]
             .last()
@@ -614,8 +605,19 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
 
         # 计算指数月收益：本月末净值 / 上月末净值 - 1
         idx_month_end["上月末净值"] = idx_month_end["月末净值"].shift(1)
-        idx_month_end["指数月收益"] = idx_month_end["月末净值"] / idx_month_end["上月末净值"] - 1
-        idx_month = idx_month_end[["年月", "指数月收益"]].dropna()
+        # 今年以来场景下，若缺少上一年12月数据，首月改用指数区间起始点作为基准
+        if period == "今年以来" and len(idx_month_end) > 0:
+            first_idx = idx_month_end.index[0]
+            idx_start_row = idx_sub_copy[idx_sub_copy["NAV_DT"] == idx_start_date]
+            if len(idx_start_row) > 0:
+                idx_start_close = idx_start_row.iloc[0]["INDEX_CLOSE"]
+            elif len(idx_sub_copy) > 0:
+                idx_start_close = idx_sub_copy.iloc[0]["INDEX_CLOSE"]
+            else:
+                idx_start_close = np.nan
+            if pd.isna(idx_month_end.loc[first_idx, "上月末净值"]) and pd.notna(idx_start_close) and idx_start_close > 0:
+                idx_month_end.loc[first_idx, "上月末净值"] = idx_start_close
+        idx_month = _filter_complete_month_returns(idx_month_end, "指数月收益", complete_months)
 
         idx_daily_ret = idx_sub_copy.set_index("NAV_DT")["INDEX_CLOSE"].pct_change().dropna()
 
