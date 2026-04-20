@@ -354,6 +354,64 @@ def _get_idx_start_date_by_anchor(idx_df: pd.DataFrame, anchor_dt: pd.Timestamp)
     return idx_before["NAV_DT"].max()
 
 
+def _normalize_timestamp(ts):
+    if pd.isna(ts):
+        return pd.NaT
+    return pd.to_datetime(ts)
+
+
+def _is_product_eligible_for_row(
+        comp_row: pd.Series,
+        target_row: pd.Series,
+        product_base_info: pd.DataFrame
+) -> bool:
+    comp_prd_code = comp_row["产品代码"]
+    comp_base = product_base_info[product_base_info["PRD_CODE"] == comp_prd_code]
+    if len(comp_base) == 0:
+        return False
+
+    comp_established_dt = comp_base["FOUND_DT"].iloc[0]
+    if pd.isna(comp_established_dt):
+        return False
+
+    period = target_row["周期"]
+    target_start = _normalize_timestamp(target_row["THEORY_START_DT"])
+
+    if pd.isna(target_start):
+        return False
+
+    if period == "成立以来":
+        target_code = target_row["产品代码"]
+        target_base = product_base_info[product_base_info["PRD_CODE"] == target_code]
+        if len(target_base) == 0:
+            return False
+        target_established_dt = target_base["FOUND_DT"].iloc[0]
+        if pd.isna(target_established_dt):
+            return False
+        return comp_established_dt <= target_established_dt
+
+    # 非成立以来：成立日在计算区间之后（> 区间起始日）不参与
+    return comp_established_dt <= target_start
+
+
+def _get_comparable_product_indices(
+        df: pd.DataFrame,
+        target_row: pd.Series,
+        product_base_info: pd.DataFrame
+) -> list:
+    comparable_indices = []
+    for comp_idx, comp_row in df.iterrows():
+        if comp_row["产品类型"] != target_row["产品类型"]:
+            continue
+        if comp_row["周期"] != target_row["周期"]:
+            continue
+        if comp_row["计算基准日"] != target_row["计算基准日"]:
+            continue
+        if _is_product_eligible_for_row(comp_row, target_row, product_base_info):
+            comparable_indices.append(comp_idx)
+    return comparable_indices
+
+
 # --------------------------------------------------
 # 5. 单产品指标计算
 # --------------------------------------------------
@@ -478,7 +536,7 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
 
         # ========== 足月逻辑：先标记哪些月份是完整月份 ==========
         complete_months = []  # 初始化为空列表
-        
+
         if len(full_nav_series) >= 1:
             # 获取实际的数据起始日和结束日
             actual_data_start = full_nav_series["NAV_DT"].min()
@@ -486,11 +544,11 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
 
             # 提取所有月份
             all_months = full_nav_series["年月"].unique()
-            
+
             # 标记每个月是否完整
             for month_period in all_months:
                 is_complete = True
-                
+
                 # 检查起始月是否完整
                 if month_period == actual_data_start.to_period("M"):
                     if day_type == "交易日" and trading_days_df is not None:
@@ -510,7 +568,7 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
                         # 自然日模式：如果起始日不是该月1号，则不完整
                         if actual_data_start.day != 1:
                             is_complete = False
-                
+
                 # 检查结束月是否完整
                 if month_period == actual_data_end.to_period("M"):
                     if day_type == "交易日" and trading_days_df is not None:
@@ -531,7 +589,7 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
                         end_month_last_day = (actual_data_end + pd.offsets.MonthEnd(0))
                         if actual_data_end.day != end_month_last_day.day:
                             is_complete = False
-                
+
                 if is_complete:
                     complete_months.append(month_period)
 
@@ -572,6 +630,8 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
                 "周期": period,
                 "计算基准日": current_dt.date(),
                 "THEORY_START_DT": theory_start_dt_for_rank,
+                "INDEX_START_DT_CALC": idx_start_date,
+                "INDEX_END_DT_CALC": idx_end_date,
                 "收益": total_ret,
                 "年化收益": ann_ret,
                 "Alpha": np.nan,
@@ -615,7 +675,8 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
                 idx_start_close = idx_sub_copy.iloc[0]["INDEX_CLOSE"]
             else:
                 idx_start_close = np.nan
-            if pd.isna(idx_month_end.loc[first_idx, "上月末净值"]) and pd.notna(idx_start_close) and idx_start_close > 0:
+            if pd.isna(idx_month_end.loc[first_idx, "上月末净值"]) and pd.notna(
+                    idx_start_close) and idx_start_close > 0:
                 idx_month_end.loc[first_idx, "上月末净值"] = idx_start_close
         idx_month = _filter_complete_month_returns(idx_month_end, "指数月收益", complete_months)
 
@@ -642,11 +703,14 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
         }
 
         results.append({
+            "计算模式": day_type,
             "产品代码": prd_code,
             "产品类型": prd_typ,
             "周期": period,
             "计算基准日": current_dt.date(),
             "THEORY_START_DT": theory_start_dt_for_rank,
+            "INDEX_START_DT_CALC": idx_start_date,
+            "INDEX_END_DT_CALC": idx_end_date,
             "收益": total_ret,
             "年化收益": ann_ret,
             **metrics
@@ -658,55 +722,66 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
 # --------------------------------------------------
 # 6. 同类平均 & 沪深300（基于全部产品）
 # --------------------------------------------------
-def build_benchmark_and_avg(df: pd.DataFrame, idx_df: pd.DataFrame, day_type="自然日") -> pd.DataFrame:
-    rows = []
+def build_benchmark_and_avg(
+        df: pd.DataFrame,
+        idx_df: pd.DataFrame,
+        product_base_info: pd.DataFrame,
+        day_type="自然日",
+        trading_days_df=None
+) -> pd.DataFrame:
+    result = df.copy()
+    metrics = ["收益", "年化收益", "Alpha", "月超额胜率", "进攻能力"]
 
-    for (typ, period), g in df.groupby(["产品类型", "周期"]):
-        rows.append({
-            "产品代码": "同类平均",
-            "产品类型": typ,
-            "周期": period,
-            "计算基准日": g["计算基准日"].iloc[0],
-            "收益": g["收益"].mean(),
-            "年化收益": g["年化收益"].mean(),
-            "Alpha": g["Alpha"].mean(),
-            "月超额胜率": g["月超额胜率"].mean(),
-            "进攻能力": g["进攻能力"].mean()
-        })
+    for metric in metrics:
+        result[f"同类平均{metric}"] = np.nan
+        result[f"沪深300{metric}"] = np.nan
 
-    base_dt = pd.to_datetime(df["计算基准日"].iloc[0])
-    for period in df["周期"].unique():
-        start_dt = get_period_start(base_dt, period)
-        if start_dt is None:
-            start_dt = idx_df["NAV_DT"].min()
+    for idx, row in result.iterrows():
+        comparable_indices = _get_comparable_product_indices(result, row, product_base_info)
+        if len(comparable_indices) > 0:
+            comparable_df = result.loc[comparable_indices]
+            for metric in metrics:
+                result.loc[idx, f"同类平均{metric}"] = comparable_df[metric].mean()
+
+        idx_start_dt = _normalize_timestamp(row.get("INDEX_START_DT_CALC", pd.NaT))
+        idx_end_dt = _normalize_timestamp(row.get("INDEX_END_DT_CALC", pd.NaT))
+        if pd.isna(idx_start_dt) or pd.isna(idx_end_dt):
+            continue
 
         idx_sub = idx_df[
-            (idx_df["NAV_DT"] >= start_dt) &
-            (idx_df["NAV_DT"] <= base_dt)
+            (idx_df["NAV_DT"] >= idx_start_dt) &
+            (idx_df["NAV_DT"] <= idx_end_dt)
             ]
+
+        # ========== 交易日模式：剔除非交易日 ==========
+        if day_type == "交易日" and trading_days_df is not None:
+            trading_dates = set(trading_days_df[trading_days_df["IS_TRD_DT"] == True]["CALD_DATE"].values)
+            idx_sub = idx_sub[idx_sub["NAV_DT"].isin(trading_dates)].copy()
 
         if len(idx_sub) < 2:
             continue
 
         ret = idx_sub["INDEX_CLOSE"].iloc[-1] / idx_sub["INDEX_CLOSE"].iloc[0] - 1
-        days = (idx_sub["NAV_DT"].iloc[-1] - idx_sub["NAV_DT"].iloc[0]).days
 
-        # 沪深300始终使用365天作为年化系数
-        ann_ret = (1 + ret) ** (365 / max(days, 1)) - 1
+        # ========== 根据计算模式选择年化系数和天数计算方式 ==========
+        if day_type == "交易日" and trading_days_df is not None:
+            # 交易日模式：使用250天作为年化系数，计算交易日天数
+            days = len(idx_sub)
+            annual_days = 250
+        else:
+            # 自然日模式：使用365天作为年化系数，计算自然日天数
+            days = (idx_sub["NAV_DT"].iloc[-1] - idx_sub["NAV_DT"].iloc[0]).days
+            annual_days = 365
 
-        rows.append({
-            "产品代码": "沪深300",
-            "产品类型": "指数",
-            "周期": period,
-            "计算基准日": base_dt.date(),
-            "收益": ret,
-            "年化收益": ann_ret,
-            "Alpha": 0,
-            "月超额胜率": np.nan,
-            "进攻能力": 1
-        })
+        ann_ret = (1 + ret) ** (annual_days / max(days, 1)) - 1
 
-    return pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
+        result.loc[idx, "沪深300收益"] = ret
+        result.loc[idx, "沪深300年化收益"] = ann_ret
+        result.loc[idx, "沪深300Alpha"] = 0
+        result.loc[idx, "沪深300月超额胜率"] = np.nan
+        result.loc[idx, "沪深300进攻能力"] = 1
+
+    return result
 
 
 # --------------------------------------------------
@@ -725,8 +800,8 @@ def rank_by_established_date(df: pd.DataFrame, product_base_info: pd.DataFrame) 
         prd_typ = row["产品类型"]
         period = row["周期"]
 
-        # 跳过基准产品（同类平均、沪深 300）
-        if prd_code in ["同类平均", "沪深 300"]:
+        # 跳过基准产品（兼容历史口径）
+        if prd_code in ["同类平均", "沪深300", "沪深 300"]:
             continue
 
         # 获取该产品的成立日（从基础信息表）
@@ -738,49 +813,10 @@ def rank_by_established_date(df: pd.DataFrame, product_base_info: pd.DataFrame) 
         if pd.isna(fund_established_dt):
             continue
 
-        # ========== 统一使用 THEORY_START_DT 进行判断 ==========
-        target_start = row["THEORY_START_DT"]
-
-        # 判断：成立日必须 <= 周期开始日
-        eligible_flag = (fund_established_dt <= target_start)
-
-        if not eligible_flag:
+        if not _is_product_eligible_for_row(row, row, product_base_info):
             continue
 
-        # 找出所有同类型、同周期且符合条件的产品
-        comparable_products = []
-        for comp_idx, comp_row in df.iterrows():
-            # 必须同类型、同周期、同计算基准日，且不是基准产品
-            if (comp_row["产品类型"] != prd_typ or
-                    comp_row["计算基准日"] != row["计算基准日"] or
-                    comp_row["产品代码"] in ["同类平均", "沪深 300"]):
-                continue
-
-            comp_prd_code = comp_row["产品代码"]
-            comp_prd_base = product_base_info[product_base_info["PRD_CODE"] == comp_prd_code]
-            if len(comp_prd_base) == 0:
-                continue
-
-            comp_established_dt = comp_prd_base["FOUND_DT"].iloc[0]
-            if pd.isna(comp_established_dt):
-                continue
-
-            # 判断可比产品是否符合条件：成立日 <= 该产品对应的THEORY_START_DT
-            comp_target_start = comp_row["THEORY_START_DT"]
-            comp_eligible = (comp_established_dt <= comp_target_start)
-
-            if not comp_eligible:
-                continue
-
-            # 成立以来：只纳入成立日 <= 该产品成立日的产品
-            # 其他周期：只纳入成立日 <= 周期开始日的产品
-            if period == "成立以来":
-                if comp_established_dt <= fund_established_dt:
-                    comparable_products.append(comp_idx)
-            else:
-                period_start = row["THEORY_START_DT"]
-                if comp_established_dt <= period_start:
-                    comparable_products.append(comp_idx)
+        comparable_products = _get_comparable_product_indices(df, row, product_base_info)
 
         if len(comparable_products) == 0:
             continue
@@ -833,14 +869,42 @@ def main(index_secu_id="000300.IDX.CSIDX", day_type="交易日"):
                                                 day_type, trading_days_df))
 
     df = pd.DataFrame(all_results)
-    df_rank = build_benchmark_and_avg(df, idx_df, day_type)
+    df_rank = build_benchmark_and_avg(df, idx_df, product_base_info, day_type, trading_days_df)
     df_rank = rank_by_established_date(df_rank, product_base_info)
 
-    pct_cols = ["收益", "年化收益", "Alpha", "月超额胜率", "进攻能力"]
+    # ========== 产品指标 → 指数指标 → 同类平均指标 → 排名 ==========
+    base_cols = ["产品代码", "产品类型", "周期", "计算基准日", "THEORY_START_DT", "计算模式"]
+
+    # 产品自身指标
+    product_metrics = ["收益", "年化收益", "Alpha", "月超额胜率", "进攻能力"]
+
+    # 沪深300指数指标
+    index_metrics = ["沪深300收益", "沪深300年化收益", "沪深300Alpha", "沪深300月超额胜率", "沪深300进攻能力"]
+
+    # 同类平均指标
+    category_avg_metrics = ["同类平均收益", "同类平均年化收益", "同类平均Alpha", "同类平均月超额胜率",
+                            "同类平均进攻能力"]
+
+    # 排名指标
+    rank_metrics = ["收益排名", "年化收益排名", "Alpha排名", "月超额胜率排名", "进攻能力排名"]
+
+    # 按顺序组合所有列
+    ordered_cols = base_cols + product_metrics + index_metrics + category_avg_metrics + rank_metrics
+
+    # 只保留存在的列（避免 KeyError）
+    final_cols = [col for col in ordered_cols if col in df_rank.columns]
+    df_rank = df_rank[final_cols]
+
+    pct_cols = [
+        "收益", "年化收益", "Alpha", "月超额胜率", "进攻能力",
+        "同类平均收益", "同类平均年化收益", "同类平均Alpha", "同类平均月超额胜率", "同类平均进攻能力",
+        "沪深300收益", "沪深300年化收益", "沪深300Alpha", "沪深300月超额胜率", "沪深300进攻能力"
+    ]
     for col in pct_cols:
-        df_rank[col] = df_rank[col].apply(
-            lambda x: f"{x:.2%}" if pd.notna(x) else x
-        )
+        if col in df_rank.columns:
+            df_rank[col] = df_rank[col].apply(
+                lambda x: f"{x:.2%}" if pd.notna(x) else x
+            )
 
     return df_rank
 
