@@ -468,8 +468,7 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
                     actual_start_dt = first_nav_after_establish["NAV_DT"]
                     virtual_start_dt = actual_theoretical_start
                 else:
-                    fund_earliest_dt = prd_df_clean["NAV_DT"].min()
-                    virtual_start_dt = fund_earliest_dt - pd.Timedelta(days=1)
+                    virtual_start_dt = fund_established_dt - pd.Timedelta(days=1)
                     nav_start = 1.0
                     actual_start_dt = virtual_start_dt
             else:
