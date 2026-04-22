@@ -1,9 +1,11 @@
+import os
 import oracledb
 import pandas as pd
 import numpy as np
 from datetime import timedelta
 from dateutil.relativedelta import relativedelta
 import time
+from concurrent.futures import ProcessPoolExecutor
 
 # --------------------------------------------------
 # 1. 数据库连接
@@ -24,7 +26,11 @@ def get_oracle_conn():
 # --------------------------------------------------
 # 2. 数据获取
 # --------------------------------------------------
-def fetch_fin_prd_nav() -> pd.DataFrame:
+def fetch_fin_prd_nav(
+        nav_dt_from: str | None = None,
+        nav_dt_to: str | None = None,
+) -> pd.DataFrame:
+    """全量拉取净值表；可选 NAV_DT 闭区间（YYYYMMDD 字符串），与交易日历对齐以缩小扫描。"""
     sql = """
           SELECT PRD_CODE, \
                  PRD_TYP, \
@@ -36,6 +42,13 @@ def fetch_fin_prd_nav() -> pd.DataFrame:
           FROM DATA_MART_04.FIN_PRD_NAV
           WHERE AGGR_UNIT_NVAL IS NOT NULL \
           """
+    extra = []
+    if nav_dt_from:
+        extra.append(f"NAV_DT >= '{nav_dt_from}'")
+    if nav_dt_to:
+        extra.append(f"NAV_DT <= '{nav_dt_to}'")
+    if extra:
+        sql += " AND " + " AND ".join(extra)
     with get_oracle_conn() as conn:
         df = pd.read_sql(sql, con=conn)
 
@@ -62,11 +75,20 @@ def fetch_pty_prd_base_info() -> pd.DataFrame:
     return df
 
 
-def fetch_index_quote(index_secu_id: str) -> pd.DataFrame:
+def fetch_index_quote(
+        index_secu_id: str,
+        trd_dt_from: str | None = None,
+        trd_dt_to: str | None = None,
+) -> pd.DataFrame:
+    conds = [f"SECU_ID = '{index_secu_id}'"]
+    if trd_dt_from:
+        conds.append(f"TRD_DT >= '{trd_dt_from}'")
+    if trd_dt_to:
+        conds.append(f"TRD_DT <= '{trd_dt_to}'")
     sql = f"""
     SELECT TRD_DT, CLS_PRC
     FROM VAR_SECU_DQUOT
-    WHERE SECU_ID = '{index_secu_id}'
+    WHERE {" AND ".join(conds)}
     """
     with get_oracle_conn() as conn:
         df = pd.read_sql(sql, con=conn)
@@ -160,7 +182,7 @@ def _has_missing_data_in_period(
     """
     与「收益能力指标」一致：从 start_dt 到 end_dt 内，自然日需逐日有净值，交易日需每个交易日有净值，否则视为缺失。
     """
-    period_nav = nav_df[(nav_df["NAV_DT"] >= start_dt) & (nav_df["NAV_DT"] <= end_dt)].copy()
+    period_nav = nav_df[(nav_df["NAV_DT"] >= start_dt) & (nav_df["NAV_DT"] <= end_dt)]
     if period_nav.empty:
         return True
 
@@ -189,6 +211,30 @@ def _empty_risk_metrics_result(period: str) -> dict:
         "下行风险": np.nan,
         "防守能力": np.nan,
     }
+
+
+def _mean_recovery_days_vectorized(
+        nav_dt: np.ndarray,
+        cum_ret: np.ndarray,
+        drawdown: np.ndarray,
+        hist_peak: np.ndarray,
+        thresh: float = -0.01,
+) -> float:
+    """显著回撤点（回撤 < thresh）至累计收益重新触及该点「历史最高」的平均自然日修复天数。"""
+    sig = drawdown < thresh
+    if not np.any(sig):
+        return np.nan
+    days_list = []
+    for pos in np.flatnonzero(sig):
+        target_peak = hist_peak[pos]
+        tail = cum_ret[pos:]
+        mask = tail >= target_peak
+        if not np.any(mask):
+            continue
+        j = pos + int(np.flatnonzero(mask)[0])
+        d = (pd.Timestamp(nav_dt[j]) - pd.Timestamp(nav_dt[pos])).days
+        days_list.append(d)
+    return float(np.mean(days_list)) if days_list else np.nan
 
 
 def _apply_day_type_to_fund_idx_returns(
@@ -326,7 +372,7 @@ def calc_risk_metrics(
         day_type: str = "交易日",
         trading_days_df: pd.DataFrame = None,
 ) -> dict:
-    prd_df = prd_df.sort_values("NAV_DT").copy()
+    prd_df = prd_df.sort_values("NAV_DT")
     base_dt = prd_df["NAV_DT"].max()
     fund_established_dt = get_fund_established_dt(prd_df, df_base_info)
 
@@ -334,7 +380,7 @@ def calc_risk_metrics(
 
     prd_df_clean = prd_df
     if pd.notna(fund_established_dt):
-        prd_df_clean = prd_df[prd_df["NAV_DT"] >= fund_established_dt].copy()
+        prd_df_clean = prd_df[prd_df["NAV_DT"] >= fund_established_dt]
     if prd_df_clean.empty:
         return _empty_risk_metrics_result(period)
 
@@ -372,8 +418,23 @@ def calc_risk_metrics(
     if pd.isna(nav_start) or pd.isna(nav_end) or nav_start <= 0:
         return _empty_risk_metrics_result(period)
 
-    # 区间内日收益率（与 UNIT_NVAL 区间序列一致）
-    sub["日收益"] = sub["UNIT_NVAL"].pct_change()
+    # 基金日收益只算一次（虚拟起始点与贝塔/波动率共用）
+    fund_nav_series = sub.set_index("NAV_DT")["UNIT_NVAL"]
+    has_virtual_start = (theory_start_dt < fund_established_dt) and (nav_start == 1.0)
+    if has_virtual_start and len(fund_nav_series) > 0:
+        first_date = fund_nav_series.index[0]
+        first_nav = fund_nav_series.iloc[0]
+        first_return = (first_nav - 1.0) / 1.0
+        if len(fund_nav_series) > 1:
+            subsequent_returns = fund_nav_series.pct_change().iloc[1:]
+            fund_daily_ret = pd.concat([
+                pd.Series([first_return], index=[first_date]),
+                subsequent_returns,
+            ]).dropna()
+        else:
+            fund_daily_ret = pd.Series([first_return], index=[first_date])
+    else:
+        fund_daily_ret = fund_nav_series.pct_change().dropna()
 
     # ========== 最大回撤：区间累计净值（起点归一）上计算 ==========
     sub["累计收益"] = sub["UNIT_NVAL"] / nav_start
@@ -396,40 +457,13 @@ def calc_risk_metrics(
 
     if len(idx_sub) >= 2:
         idx_sub = idx_sub.sort_values("NAV_DT")
-        
-        # 计算基金日收益率：处理虚拟起始点场景
-        fund_nav_series = sub.set_index("NAV_DT")["UNIT_NVAL"]
-        
-        # 判断是否存在虚拟起始点（理论起始日早于成立日，且 nav_start=1.0）
-        has_virtual_start = (theory_start_dt < fund_established_dt) and (nav_start == 1.0)
-        
-        if has_virtual_start and len(fund_nav_series) > 0:
-            # 存在虚拟起始点：成立日收益率 = (成立日净值 - 1.0) / 1.0
-            first_date = fund_nav_series.index[0]
-            first_nav = fund_nav_series.iloc[0]
-            first_return = (first_nav - 1.0) / 1.0
-            
-            # 后续日期正常计算 pct_change
-            if len(fund_nav_series) > 1:
-                subsequent_returns = fund_nav_series.pct_change().iloc[1:]
-                fund_daily_ret = pd.concat([
-                    pd.Series([first_return], index=[first_date]),
-                    subsequent_returns
-                ]).dropna()
-            else:
-                # 只有一天数据
-                fund_daily_ret = pd.Series([first_return], index=[first_date])
-        else:
-            # 正常情况：直接使用 pct_change
-            fund_daily_ret = fund_nav_series.pct_change().dropna()
-        
         idx_daily_ret = idx_sub.set_index("NAV_DT")["INDEX_CLOSE"].pct_change().dropna()
-        fund_daily_ret, idx_daily_ret = _apply_day_type_to_fund_idx_returns(
+        fund_daily_ret_m, idx_daily_ret_m = _apply_day_type_to_fund_idx_returns(
             fund_daily_ret, idx_daily_ret, day_type, trading_days_df
         )
         merged = pd.DataFrame({
-            "日收益": fund_daily_ret,
-            "指数日收益": idx_daily_ret,
+            "日收益": fund_daily_ret_m,
+            "指数日收益": idx_daily_ret_m,
         }).dropna()
 
         if len(merged) >= 10:
@@ -441,7 +475,6 @@ def calc_risk_metrics(
                 beta = cov_m[0, 1] / var_idx
             merged_valid = merged
 
-        # 年化波动率、下行风险：优先用对齐后的序列；样本过少则用基金单边日收益
         vol_src = merged["日收益"] if len(merged) >= 2 else fund_daily_ret
         if len(vol_src) >= 2:
             dv = vol_src.std()
@@ -452,42 +485,24 @@ def calc_risk_metrics(
                 downside_risk = ds * ann_scale if pd.notna(ds) else np.nan
 
     # ==========  回撤修复时间  ==========
-    # 找出所有显著回撤（超过 1%）
-    significant_drawdowns = sub[sub["回撤"] < -0.01].copy()
-
-    if len(significant_drawdowns) == 0:
-        recovery_time = np.nan
-    else:
-        # 对每个回撤点，计算到恢复的时间
-        recovery_days = []
-        for idx, row in significant_drawdowns.iterrows():
-            # 找到该时点之后的所有日期
-            future = sub[sub["NAV_DT"] >= row["NAV_DT"]].copy()
-            # 找到首次恢复到或超过历史高点的日期
-            recovered = future[future["累计收益"] >= row["历史最高"]]
-            if len(recovered) > 0:
-                days = (recovered.iloc[0]["NAV_DT"] - row["NAV_DT"]).days
-                recovery_days.append(days)
-
-        # 取平均修复时间
-        recovery_time = np.mean(recovery_days) if recovery_days else np.nan
+    nav_a = sub["NAV_DT"].to_numpy()
+    cum_a = sub["累计收益"].to_numpy(dtype=float)
+    dd_a = sub["回撤"].to_numpy(dtype=float)
+    peak_a = sub["历史最高"].to_numpy(dtype=float)
+    recovery_time = _mean_recovery_days_vectorized(nav_a, cum_a, dd_a, peak_a, thresh=-0.01)
 
     # ========== 防守能力  ==========
     if merged_valid is None or len(merged_valid) < 10:
         defensive_ability = np.nan
     else:
-        # 筛选市场下跌的交易日
-        down_days = merged_valid[merged_valid["指数日收益"] < 0].copy()
-
-        if len(down_days) < 5:  # 至少需要 5 个下跌交易日
+        down_mask = merged_valid["指数日收益"].to_numpy(dtype=float) < 0
+        if down_mask.sum() < 5:
             defensive_ability = np.nan
         else:
-            # 计算平均跌幅（取绝对值）
-            avg_fund_drop = abs(down_days["日收益"].mean())
-            avg_market_drop = abs(down_days["指数日收益"].mean())
+            avg_fund_drop = abs(np.nanmean(merged_valid["日收益"].to_numpy(dtype=float)[down_mask]))
+            avg_market_drop = abs(np.nanmean(merged_valid["指数日收益"].to_numpy(dtype=float)[down_mask]))
 
             if avg_market_drop != 0:
-                # 下跌保护比率 = 1 - (基金跌幅 / 市场跌幅)
                 defensive_ability = 1 - (avg_fund_drop / avg_market_drop)
             else:
                 defensive_ability = np.nan
@@ -514,7 +529,7 @@ def calc_product_risk_metrics(
         day_type: str = "交易日",
         trading_days_df: pd.DataFrame = None,
 ) -> list:
-    prd_df = prd_df.sort_values("NAV_DT").copy()
+    prd_df = prd_df.sort_values("NAV_DT")
     base_dt = prd_df["NAV_DT"].max()
     fund_est = pd.NaT
     if df_base_info is not None and len(df_base_info) > 0:
@@ -629,27 +644,14 @@ def _calc_hs300_risk_for_row_slice(
     if len(idx_sub) < 2:
         return {m: np.nan for m in RISK_BENCHMARK_METRICS}
     idx_sub = idx_sub.sort_values("NAV_DT").copy()
-    idx_cum = idx_sub["INDEX_CLOSE"] / idx_start
-    idx_max_dd = max_drawdown(idx_cum)
-    
-    # ========== 计算回撤修复时间 ==========
-    idx_sub["历史最高"] = idx_cum.cummax()
-    idx_sub["回撤"] = (idx_cum - idx_sub["历史最高"]) / idx_sub["历史最高"]
-    
-    significant_drawdowns = idx_sub[idx_sub["回撤"] < -0.01].copy()
-    
-    if len(significant_drawdowns) == 0:
-        recovery_time = np.nan
-    else:
-        recovery_days = []
-        for idx_pos, row in significant_drawdowns.iterrows():
-            future = idx_sub[idx_sub["NAV_DT"] >= row["NAV_DT"]].copy()
-            recovered = future[future["INDEX_CLOSE"] / idx_start >= row["历史最高"]]
-            if len(recovered) > 0:
-                days = (recovered.iloc[0]["NAV_DT"] - row["NAV_DT"]).days
-                recovery_days.append(days)
-        recovery_time = np.mean(recovery_days) if recovery_days else np.nan
-    
+    idx_cum = (idx_sub["INDEX_CLOSE"] / idx_start).to_numpy(dtype=float)
+    idx_max_dd = max_drawdown(pd.Series(idx_cum))
+
+    idx_hist = pd.Series(idx_cum).cummax().to_numpy(dtype=float)
+    idx_dd = (idx_cum - idx_hist) / idx_hist
+    nav_a = idx_sub["NAV_DT"].to_numpy()
+    recovery_time = _mean_recovery_days_vectorized(nav_a, idx_cum, idx_dd, idx_hist, thresh=-0.01)
+
     idx_daily_ret = idx_sub.set_index("NAV_DT")["INDEX_CLOSE"].pct_change().dropna()
     if day_type == "交易日" and trading_days_df is not None:
         idx_daily_ret = _filter_daily_ret_by_trading_days(idx_daily_ret, trading_days_df)
@@ -695,14 +697,13 @@ def build_benchmark_and_avg(
         ["产品类型", "周期", "计算模式", "计算基准日"]
     ).groups
 
-    for row_idx, row in result.iterrows():
-        gkey = (
-            row.get("产品类型"),
-            row.get("周期"),
-            row.get("计算模式"),
-            row.get("计算基准日"),
-        )
-        if gkey[0] is None or gkey[1] is None or gkey[2] is None or pd.isna(gkey[3]):
+    row_cols = ["产品类型", "周期", "计算模式", "计算基准日"]
+    for i in range(len(result)):
+        row_idx = result.index[i]
+        row = result.iloc[i]
+        ptyp, period, day_type, base_dt_row = (row[c] for c in row_cols)
+        gkey = (ptyp, period, day_type, base_dt_row)
+        if ptyp is None or period is None or day_type is None or pd.isna(base_dt_row):
             continue
         candidate_indices = list(group_to_indices.get(gkey, []))
         comp_ix = _get_risk_comparable_for_benchmark(
@@ -717,13 +718,10 @@ def build_benchmark_and_avg(
                 else:
                     result.at[row_idx, coln] = comp_df[m].mean()
 
-        base_dt = row.get("计算基准日")
-        period = row.get("周期")
-        day_type = row.get("计算模式", "交易日")
-        if pd.isna(base_dt):
+        if pd.isna(base_dt_row):
             continue
-        base_dt = pd.Timestamp(base_dt)
-        theory_start_dt, period_end_dt = get_period_dates_for_drawdown(base_dt, period, idx_df)
+        base_dt_ts = pd.Timestamp(base_dt_row)
+        theory_start_dt, period_end_dt = get_period_dates_for_drawdown(base_dt_ts, period, idx_df)
         idx_start = get_index_start_price(idx_df, theory_start_dt)
         if pd.isna(idx_start) or idx_start <= 0:
             continue
@@ -764,40 +762,51 @@ def rank_risk_df(df: pd.DataFrame) -> pd.DataFrame:
 
     benchmark_codes = {"同类平均", "沪深 300"}
     mask_special = df["产品代码"].isin(benchmark_codes)
-    eligible_products = df[(~mask_special) & (df["符合条件"] == True)].copy()
+    eligible_products = df[(~mask_special) & (df["符合条件"] == True)]
 
     if len(eligible_products) == 0:
         return df
 
-    for idx, row in eligible_products.iterrows():
-        fund_est = row["成立日"]
+    ep = eligible_products
+    orig_ix = ep.index.to_numpy()
+    typ = ep["产品类型"].to_numpy()
+    per = ep["周期"].to_numpy()
+    mode = ep["计算模式"].to_numpy()
+    base_dt = pd.to_datetime(ep["计算基准日"], errors="coerce").dt.normalize().to_numpy()
+    fund_est = pd.to_datetime(ep["成立日"], errors="coerce").to_numpy()
+    theory = pd.to_datetime(ep["理论起始日"], errors="coerce").to_numpy()
+    period_norm = np.array([_normalize_period_key(str(p)) for p in per])
+
+    for ii in range(len(ep)):
+        idx = orig_ix[ii]
+        fe = fund_est[ii]
+        ps = theory[ii]
         comparable_indices = []
-        for comp_idx, comp_row in eligible_products.iterrows():
-            if comp_row["产品类型"] != row["产品类型"]:
+        for jj in range(len(ep)):
+            if typ[jj] != typ[ii]:
                 continue
-            if comp_row["周期"] != row["周期"]:
+            if per[jj] != per[ii]:
                 continue
-            if comp_row["计算模式"] != row["计算模式"]:
+            if mode[jj] != mode[ii]:
                 continue
-            if pd.Timestamp(comp_row["计算基准日"]).normalize() != pd.Timestamp(row["计算基准日"]).normalize():
+            if base_dt[jj] != base_dt[ii]:
                 continue
-            comp_est = comp_row["成立日"]
+            comp_est = fund_est[jj]
             if pd.isna(comp_est):
                 continue
-            if _normalize_period_key(row["周期"]) == "成立以来":
-                if pd.notna(fund_est) and pd.Timestamp(comp_est).normalize() <= pd.Timestamp(fund_est).normalize():
-                    comparable_indices.append(comp_idx)
+            if period_norm[ii] == "成立以来":
+                if pd.notna(fe) and pd.Timestamp(comp_est).normalize() <= pd.Timestamp(fe).normalize():
+                    comparable_indices.append(orig_ix[jj])
             else:
-                ps = row["理论起始日"]
                 if pd.isna(ps):
                     continue
                 if pd.Timestamp(comp_est).normalize() <= pd.Timestamp(ps).normalize():
-                    comparable_indices.append(comp_idx)
+                    comparable_indices.append(orig_ix[jj])
 
         if not comparable_indices:
             continue
 
-        comparable_df = eligible_products.loc[comparable_indices]
+        comparable_df = ep.loc[comparable_indices]
         total_count = len(comparable_df)
 
         for col in smaller_is_better:
@@ -866,31 +875,91 @@ def format_output(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------
 # 10. 主流程
 # --------------------------------------------------
-def main(index_secu_id="000300.IDX.CSIDX", day_type="交易日"):
+def _build_prd_base_dict(df_base_info: pd.DataFrame) -> dict:
+    """PRD_CODE -> 基础信息行 dict，O(1) 查找。"""
+    if df_base_info is None or len(df_base_info) == 0:
+        return {}
+    return (
+        df_base_info.dropna(subset=["PRD_CODE"])
+        .drop_duplicates(subset=["PRD_CODE"], keep="first")
+        .set_index("PRD_CODE")
+        .to_dict("index")
+    )
+
+
+def _base_df_for_product(base_by_code: dict, prd_code) -> pd.DataFrame | None:
+    row = base_by_code.get(prd_code)
+    if row is None:
+        return None
+    return pd.DataFrame([row])
+
+
+class _RiskMpPoolCtx:
+    idx_df = None
+    periods = None
+
+
+def _risk_mp_init(idx_df, periods):
+    _RiskMpPoolCtx.idx_df = idx_df
+    _RiskMpPoolCtx.periods = periods
+
+
+def _risk_mp_one(task):
+    g, base_df, day_type, td = task
+    return calc_product_risk_metrics(
+        g,
+        _RiskMpPoolCtx.idx_df,
+        _RiskMpPoolCtx.periods,
+        base_df,
+        day_type=day_type,
+        trading_days_df=td,
+    )
+
+
+def main(index_secu_id="000300.IDX.CSIDX", day_type="自然日"):
     periods = ["近 1 年", "近 2 年", "近 3 年", "近 5 年", "今年以来", "成立以来"]
     modes = ["自然日", "交易日"] if day_type is None else [day_type]
 
-    # 获取数据
-    prd_df = fetch_fin_prd_nav()
-    idx_df = fetch_index_quote(index_secu_id)
-    df_base_info = fetch_pty_prd_base_info()
-    prd_df = fill_special_prd_typ(prd_df, df_base_info)
-    trading_days_df = fetch_trading_days() if "交易日" in modes else None
+    # 全量 4 表各查一次；净值与指数按交易日历 NAV_DT/TRD_DT 闭区间过滤（与原先全表相比不丢日历覆盖内的数据）
+    trading_days_cal = fetch_trading_days()
+    cal = trading_days_cal["CALD_DATE"].dropna()
+    nav_from = pd.Timestamp(cal.min()).strftime("%Y%m%d")
+    nav_to = pd.Timestamp(cal.max()).strftime("%Y%m%d")
 
-    # 计算所有产品的风险指标
+    prd_df = fetch_fin_prd_nav(nav_dt_from=nav_from, nav_dt_to=nav_to)
+    idx_df = fetch_index_quote(index_secu_id, trd_dt_from=nav_from, trd_dt_to=nav_to)
+    df_base_info = fetch_pty_prd_base_info()
+    base_by_code = _build_prd_base_dict(df_base_info)
+    prd_df = fill_special_prd_typ(prd_df, df_base_info)
+    trading_days_df = trading_days_cal if "交易日" in modes else None
+
+    grouped = list(prd_df.groupby("PRD_CODE", sort=False))
     all_results = []
+
     for m in modes:
         td_m = trading_days_df if m == "交易日" else None
-        for _, g in prd_df.groupby("PRD_CODE"):
+        tasks = []
+        for _, g in grouped:
             prd_code = g["PRD_CODE"].iloc[0]
-            base_rows = df_base_info[df_base_info["PRD_CODE"] == prd_code]
-            results = calc_product_risk_metrics(
-                g, idx_df, periods,
-                base_rows if len(base_rows) else None,
-                day_type=m,
-                trading_days_df=td_m,
-            )
-            all_results.extend(results)
+            tasks.append((g, _base_df_for_product(base_by_code, prd_code), m, td_m))
+
+        n_workers = min(os.cpu_count() or 4, len(tasks)) if tasks else 0
+        if len(tasks) >= 6 and n_workers > 1:
+            with ProcessPoolExecutor(
+                    max_workers=n_workers,
+                    initializer=_risk_mp_init,
+                    initargs=(idx_df, periods),
+            ) as pool:
+                for chunk in pool.map(_risk_mp_one, tasks, chunksize=1):
+                    all_results.extend(chunk)
+        else:
+            for g, base_df, m2, td_m2 in tasks:
+                all_results.extend(
+                    calc_product_risk_metrics(
+                        g, idx_df, periods, base_df,
+                        day_type=m2, trading_days_df=td_m2,
+                    )
+                )
 
     df = pd.DataFrame(all_results)
 

@@ -1,8 +1,10 @@
 import oracledb
 import pandas as pd
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
 import os
+import time
 
 
 # --------------------------------------------------
@@ -19,6 +21,107 @@ def get_oracle_conn():
         password="8EFmdaej2JeKwt",
         dsn=dsn
     )
+
+
+def _to_np_datetime64(ts) -> np.datetime64:
+    if isinstance(ts, np.datetime64):
+        return ts
+    return np.datetime64(pd.Timestamp(ts).to_datetime64())
+
+
+def _sorted_trading_dates_np(trading_dates_set: set) -> np.ndarray:
+    if not trading_dates_set:
+        return np.array([], dtype="datetime64[ns]")
+    arr = np.array(
+        [np.datetime64(pd.Timestamp(t).to_datetime64()) for t in trading_dates_set],
+        dtype="datetime64[ns]",
+    )
+    arr.sort()
+    return arr
+
+
+def _trading_days_between_exclusive_start(
+        virtual_start_dt,
+        current_dt,
+        trading_dates_sorted_np: np.ndarray,
+) -> tuple:
+    """
+    等价于原 trading_days_df 上 (CALD_DATE > virtual_start_dt)
+    & (CALD_DATE <= current_dt) & IS_TRD_DT 的区间交易日序列。
+    返回 (区间交易日数, actual_end_dt)。
+    """
+    if trading_dates_sorted_np is None or len(trading_dates_sorted_np) == 0:
+        return 0, current_dt
+
+    v = _to_np_datetime64(virtual_start_dt)
+    c = _to_np_datetime64(current_dt)
+
+    i_left = np.searchsorted(trading_dates_sorted_np, v, side="right")
+    i_right = np.searchsorted(trading_dates_sorted_np, c, side="right")
+    in_range = trading_dates_sorted_np[i_left:i_right]
+    days_since = int(in_range.size)
+
+    j = np.searchsorted(trading_dates_sorted_np, c, side="left")
+    c_is_trd = j < len(trading_dates_sorted_np) and trading_dates_sorted_np[j] == c
+    if c_is_trd:
+        actual_end_dt = current_dt
+    else:
+        if in_range.size > 0:
+            actual_end_dt = pd.Timestamp(in_range[-1])
+        else:
+            actual_end_dt = current_dt
+
+    return days_since, actual_end_dt
+
+
+def _next_trading_gap_days(current_date, trading_dates_sorted_np: np.ndarray) -> int:
+    """下一交易日与 current_date 的日历间隔天数（与原先 Series 搜索逻辑一致）。"""
+    if trading_dates_sorted_np is None or len(trading_dates_sorted_np) == 0:
+        return 1
+    c = _to_np_datetime64(current_date)
+    j = np.searchsorted(trading_dates_sorted_np, c, side="right")
+    if j >= len(trading_dates_sorted_np):
+        return 1
+    nxt = pd.Timestamp(trading_dates_sorted_np[j])
+    cur = pd.Timestamp(current_date)
+    return max(int((nxt - cur).days), 1)
+
+
+def _prev_trading_day_on_or_before(dt, trading_dates_sorted_np: np.ndarray) -> pd.Timestamp:
+    if trading_dates_sorted_np is None or len(trading_dates_sorted_np) == 0:
+        return dt
+    c = _to_np_datetime64(dt)
+    j = np.searchsorted(trading_dates_sorted_np, c, side="right") - 1
+    if j < 0:
+        return dt
+    return pd.Timestamp(trading_dates_sorted_np[j])
+
+
+def _expected_trading_dates_in_closed_range(
+        start_dt, end_dt, trading_dates_sorted_np: np.ndarray
+) -> set:
+    if trading_dates_sorted_np is None or len(trading_dates_sorted_np) == 0:
+        return set()
+    s = _to_np_datetime64(start_dt)
+    e = _to_np_datetime64(end_dt)
+    i0 = np.searchsorted(trading_dates_sorted_np, s, side="left")
+    i1 = np.searchsorted(trading_dates_sorted_np, e, side="right")
+    return {pd.Timestamp(x) for x in trading_dates_sorted_np[i0:i1]}
+
+
+def _trading_days_between_exclusive_start_hs300(
+        start_dt,
+        end_dt,
+        trading_dates_sorted_np: np.ndarray,
+) -> int:
+    """等价于 (CALD_DATE > start_dt) & (CALD_DATE <= end_dt) & 交易日 的数量。"""
+    if trading_dates_sorted_np is None or len(trading_dates_sorted_np) == 0:
+        return 0
+    s = _to_np_datetime64(start_dt)
+    e = _to_np_datetime64(end_dt)
+    i_left = np.searchsorted(trading_dates_sorted_np, s, side="right")
+    i_right = np.searchsorted(trading_dates_sorted_np, e, side="right")
+    return int(i_right - i_left)
 
 
 # --------------------------------------------------
@@ -92,7 +195,7 @@ def fetch_product_base_info() -> pd.DataFrame:
 # 3. 产品类型填充
 # --------------------------------------------------
 def fill_special_prd_typ(df_nav: pd.DataFrame, df_base_info: pd.DataFrame) -> pd.DataFrame:
-    df = df_nav.copy()
+    df = df_nav.copy(deep=False)
 
     # 检查基础信息表中是否有 PRD_TYP 字段
     if "PRD_TYP" in df_base_info.columns:
@@ -182,13 +285,20 @@ def calc_period_annualized(
         start_aggr: float = 1.0,
         day_type: str = "自然日",
         trading_days_df: pd.DataFrame = None,
+        trading_dates_sorted_np: np.ndarray = None,
 ) -> tuple:
     # 初始化实际期末日
     actual_end_dt = current_dt
 
     # 计算持有天数和年化天数
     if day_type == "交易日":
-        if trading_days_df is not None:
+        if trading_dates_sorted_np is not None and len(trading_dates_sorted_np) > 0:
+            days_since, actual_end_dt = _trading_days_between_exclusive_start(
+                virtual_start_dt,
+                current_dt,
+                trading_dates_sorted_np,
+            )
+        elif trading_days_df is not None:
             # 过滤出虚拟起始点到计算基准日之间的交易日
             trading_days = trading_days_df[
                 (trading_days_df["CALD_DATE"] > virtual_start_dt) &
@@ -267,7 +377,8 @@ def calc_alpha_metric_from_daily_returns(
         fund_daily_ret: pd.Series,
         idx_daily_ret: pd.Series,
         day_type: str = "自然日",
-        trading_days_df: pd.DataFrame = None
+        trading_days_df: pd.DataFrame = None,
+        trading_dates_sorted_np: np.ndarray = None,
 ) -> float:
     if len(fund_daily_ret) < 2 or len(idx_daily_ret) < 2:
         return np.nan
@@ -298,13 +409,13 @@ def calc_alpha_metric_from_daily_returns(
     else:
         fund_excess_ret_list = []
         idx_excess_ret_list = []
-        daily_rf_list = []
-        holiday_days_list = []
 
         for i in range(len(merged)):
             current_date = merged.index[i]
 
-            if trading_days_df is not None:
+            if trading_dates_sorted_np is not None and len(trading_dates_sorted_np) > 0:
+                holiday_days = _next_trading_gap_days(current_date, trading_dates_sorted_np)
+            elif trading_days_df is not None:
                 trading_dates = trading_days_df[trading_days_df["IS_TRD_DT"] == True]["CALD_DATE"].sort_values()
                 next_trading_date = trading_dates[trading_dates > current_date]
 
@@ -317,8 +428,6 @@ def calc_alpha_metric_from_daily_returns(
                 holiday_days = 1
 
             daily_rf = (ann_rf / 365) * holiday_days
-            daily_rf_list.append(daily_rf)
-            holiday_days_list.append(holiday_days)
 
             fund_excess_ret_list.append(merged.iloc[i]["fund_ret"] - daily_rf)
             idx_excess_ret_list.append(merged.iloc[i]["idx_ret"] - daily_rf)
@@ -360,7 +469,7 @@ def _add_virtual_start_nav(prd_df_clean: pd.DataFrame, virtual_start_dt: pd.Time
 
 
 def _filter_complete_month_returns(month_df: pd.DataFrame, value_col: str, complete_months: list) -> pd.DataFrame:
-    month_df = month_df.copy()
+    month_df = month_df.copy(deep=False)
     if "上月末净值" not in month_df.columns:
         month_df["上月末净值"] = month_df["月末净值"].shift(1)
     month_df[value_col] = month_df["月末净值"] / month_df["上月末净值"] - 1
@@ -381,14 +490,19 @@ def _has_missing_data_in_period(
         start_dt: pd.Timestamp,
         end_dt: pd.Timestamp,
         day_type: str = "自然日",
-        trading_days_df: pd.DataFrame = None
+        trading_days_df: pd.DataFrame = None,
+        trading_dates_sorted_np: np.ndarray = None,
 ) -> bool:
-    period_nav = nav_df[(nav_df["NAV_DT"] >= start_dt) & (nav_df["NAV_DT"] <= end_dt)].copy()
+    period_nav = nav_df[(nav_df["NAV_DT"] >= start_dt) & (nav_df["NAV_DT"] <= end_dt)]
     if period_nav.empty:
         return True
 
-    actual_dates = set(period_nav["NAV_DT"].dropna().unique())
-    if day_type == "交易日" and trading_days_df is not None:
+    actual_dates = {pd.Timestamp(x) for x in period_nav["NAV_DT"].dropna().unique()}
+    if day_type == "交易日" and trading_dates_sorted_np is not None and len(trading_dates_sorted_np) > 0:
+        expected_dates = _expected_trading_dates_in_closed_range(
+            start_dt, end_dt, trading_dates_sorted_np
+        )
+    elif day_type == "交易日" and trading_days_df is not None:
         expected_dates = set(
             trading_days_df[
                 (trading_days_df["IS_TRD_DT"] == True) &
@@ -452,11 +566,14 @@ def _resolve_actual_theoretical_start(
         fund_established_dt: pd.Timestamp,
         theoretical_start_dt: pd.Timestamp,
         day_type: str,
-        trading_days_df: pd.DataFrame = None
+        trading_days_df: pd.DataFrame = None,
+        trading_dates_sorted_np: np.ndarray = None,
 ) -> pd.Timestamp:
     if period == "成立以来":
         return fund_established_dt
 
+    if day_type == "交易日" and trading_dates_sorted_np is not None and len(trading_dates_sorted_np) > 0:
+        return _prev_trading_day_on_or_before(theoretical_start_dt, trading_dates_sorted_np)
     if day_type == "交易日" and trading_days_df is not None:
         trading_dates_sorted = trading_days_df[trading_days_df["IS_TRD_DT"] == True]["CALD_DATE"].sort_values()
         prev_trading_days = trading_dates_sorted[trading_dates_sorted <= theoretical_start_dt]
@@ -542,12 +659,13 @@ def _calc_hs300_metrics_for_row(
         day_type: str = "自然日",
         trading_days_df: pd.DataFrame = None,
         trading_dates_set: set = None,
+        trading_dates_sorted_np: np.ndarray = None,
 ) -> dict:
     if day_type == "交易日" and trading_days_df is not None:
         trading_dates = trading_dates_set if trading_dates_set is not None else set(
             trading_days_df[trading_days_df["IS_TRD_DT"] == True]["CALD_DATE"].values
         )
-        idx_sub = idx_sub[idx_sub["NAV_DT"].isin(trading_dates)].copy()
+        idx_sub = idx_sub[idx_sub["NAV_DT"].isin(trading_dates)]
 
     if len(idx_sub) < 2:
         return {
@@ -565,12 +683,15 @@ def _calc_hs300_metrics_for_row(
         start_dt = idx_sub["NAV_DT"].iloc[0]
         end_dt = idx_sub["NAV_DT"].iloc[-1]
 
-        trading_days_in_range = trading_days_df[
-            (trading_days_df["CALD_DATE"] > start_dt) &
-            (trading_days_df["CALD_DATE"] <= end_dt) &
-            (trading_days_df["IS_TRD_DT"] == True)
-        ]
-        days = max(len(trading_days_in_range), 1)
+        if trading_dates_sorted_np is not None and len(trading_dates_sorted_np) > 0:
+            days = max(_trading_days_between_exclusive_start_hs300(start_dt, end_dt, trading_dates_sorted_np), 1)
+        else:
+            trading_days_in_range = trading_days_df[
+                (trading_days_df["CALD_DATE"] > start_dt) &
+                (trading_days_df["CALD_DATE"] <= end_dt) &
+                (trading_days_df["IS_TRD_DT"] == True)
+            ]
+            days = max(len(trading_days_in_range), 1)
         annual_days = 250
     else:
         start_dt = idx_sub["NAV_DT"].iloc[0]
@@ -663,13 +784,15 @@ def _get_comparable_product_indices(
 # 5. 单产品指标计算
 # --------------------------------------------------
 def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
-                         day_type="自然日", trading_days_df=None, trading_dates_set=None):
+                         day_type="自然日", trading_days_df=None, trading_dates_set=None,
+                         trading_dates_sorted_np: np.ndarray = None):
     prd_df_clean = prd_df[prd_df["NAV_DT"] >= fund_established_dt].copy()
 
     if prd_df_clean.empty:
         return []
 
     prd_df_clean = prd_df_clean.sort_values("NAV_DT")
+    idx_nav_np = idx_df["NAV_DT"].to_numpy(dtype="datetime64[ns]")
     base_dt = prd_df_clean["NAV_DT"].max()
 
     prd_typ = prd_df_clean["PRD_TYP"].iloc[0]
@@ -693,7 +816,8 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
             fund_established_dt=fund_established_dt,
             theoretical_start_dt=theoretical_start_dt,
             day_type=day_type,
-            trading_days_df=trading_days_df
+            trading_days_df=trading_days_df,
+            trading_dates_sorted_np=trading_dates_sorted_np,
         )
 
         if period == "成立以来":
@@ -735,7 +859,8 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
                 start_dt=missing_check_start_dt,
                 end_dt=current_dt,
                 day_type=day_type,
-                trading_days_df=trading_days_df
+                trading_days_df=trading_days_df,
+                trading_dates_sorted_np=trading_dates_sorted_np,
         ):
             results.append(_build_metric_row(
                 day_type=day_type,
@@ -759,6 +884,7 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
             start_aggr=nav_start,
             day_type=day_type,
             trading_days_df=trading_days_df,
+            trading_dates_sorted_np=trading_dates_sorted_np,
         )
 
         if actual_end_dt != current_dt:
@@ -772,6 +898,7 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
                     start_aggr=nav_start,
                     day_type=day_type,
                     trading_days_df=trading_days_df,
+                    trading_dates_sorted_np=trading_dates_sorted_np,
                 )
                 actual_end_dt_for_monthly = actual_end_dt
             else:
@@ -782,8 +909,11 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
         if period == "成立以来":
             full_nav_series = _add_virtual_start_nav(prd_df_clean, actual_theoretical_start)
         else:
-            full_nav_series = prd_df_clean[prd_df_clean["NAV_DT"] >= actual_theoretical_start].copy()
-            full_nav_series = full_nav_series.sort_values("NAV_DT").reset_index(drop=True)
+            full_nav_series = (
+                prd_df_clean[prd_df_clean["NAV_DT"] >= actual_theoretical_start]
+                .sort_values("NAV_DT")
+                .reset_index(drop=True)
+            )
 
         if day_type == "交易日" and trading_days_df is not None:
             trading_dates = trading_dates_set if trading_dates_set is not None else set(
@@ -822,10 +952,11 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
         idx_start_date = actual_theoretical_start
         idx_end_date = current_dt
 
-        idx_sub = idx_df[
-            (idx_df["NAV_DT"] >= idx_start_date) &
-            (idx_df["NAV_DT"] <= idx_end_date)
-            ]
+        s_np = _to_np_datetime64(idx_start_date)
+        e_np = _to_np_datetime64(idx_end_date)
+        i0 = np.searchsorted(idx_nav_np, s_np, side="left")
+        i1 = np.searchsorted(idx_nav_np, e_np, side="right")
+        idx_sub = idx_df.iloc[i0:i1]
 
         if len(idx_sub) < 2:
             results.append(_build_metric_row(
@@ -842,31 +973,30 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
             ))
             continue
 
-        idx_sub_copy = idx_sub.copy()
-        idx_sub_copy["年月"] = idx_sub_copy["NAV_DT"].dt.to_period("M")
+        idx_work = idx_sub.assign(年月=idx_sub["NAV_DT"].dt.to_period("M"))
 
         # ========== 足月逻辑：只保留完整月份（与基金保持一致）==========
-        if len(idx_sub_copy) > 0:
+        if len(idx_work) > 0:
             # 使用基金的起始月和结束月作为基准
             if len(full_nav_series) > 0:
                 fund_start_month = full_nav_series["NAV_DT"].min().to_period("M")
                 fund_end_month = full_nav_series["NAV_DT"].max().to_period("M")
 
                 # 只保留基金完整月份范围内的指数数据
-                idx_sub_copy = idx_sub_copy[
-                    (idx_sub_copy["NAV_DT"].dt.to_period("M") >= fund_start_month) &
-                    (idx_sub_copy["NAV_DT"].dt.to_period("M") <= fund_end_month)
+                idx_work = idx_work[
+                    (idx_work["NAV_DT"].dt.to_period("M") >= fund_start_month) &
+                    (idx_work["NAV_DT"].dt.to_period("M") <= fund_end_month)
                     ].reset_index(drop=True)
 
-        idx_start_row = idx_sub_copy[idx_sub_copy["NAV_DT"] == idx_start_date]
+        idx_start_row = idx_work[idx_work["NAV_DT"] == idx_start_date]
         if len(idx_start_row) > 0:
             idx_start_close = idx_start_row.iloc[0]["INDEX_CLOSE"]
-        elif len(idx_sub_copy) > 0:
-            idx_start_close = idx_sub_copy.iloc[0]["INDEX_CLOSE"]
+        elif len(idx_work) > 0:
+            idx_start_close = idx_work.iloc[0]["INDEX_CLOSE"]
         else:
             idx_start_close = np.nan
         idx_month = _calc_monthly_return_series(
-            nav_series=idx_sub_copy,
+            nav_series=idx_work,
             value_col="INDEX_CLOSE",
             output_col="指数月收益",
             complete_months=complete_months,
@@ -874,7 +1004,7 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
             start_nav_value=idx_start_close
         )
 
-        idx_daily_ret = idx_sub_copy.set_index("NAV_DT")["INDEX_CLOSE"].pct_change().dropna()
+        idx_daily_ret = idx_work.set_index("NAV_DT")["INDEX_CLOSE"].pct_change().dropna()
 
         # ========== 自然日模式：对齐基金和指数的日期，确保两者都有数据 ==========
         if day_type == "自然日":
@@ -893,7 +1023,8 @@ def calc_product_metrics(prd_df, idx_df, periods, fund_established_dt,
             fund_daily_ret=fund_daily_ret,
             idx_daily_ret=idx_daily_ret,
             day_type=day_type,
-            trading_days_df=trading_days_df
+            trading_days_df=trading_days_df,
+            trading_dates_sorted_np=trading_dates_sorted_np,
         )
 
         monthly_win_rate = calc_monthly_win_rate_metric_from_monthly_returns(fund_month, idx_month)
@@ -926,9 +1057,10 @@ def build_benchmark_and_avg(
         idx_df: pd.DataFrame,
         product_base_info: pd.DataFrame,
         day_type="自然日",
-        trading_days_df=None
+        trading_days_df=None,
+        trading_dates_sorted_np: np.ndarray = None,
 ) -> pd.DataFrame:
-    result = df.copy()
+    result = df.copy(deep=False)
     metrics = ["收益", "年化收益", "Alpha", "月超额胜率", "进攻能力"]
     established_dt_map = (
         product_base_info.dropna(subset=["PRD_CODE"])
@@ -939,6 +1071,9 @@ def build_benchmark_and_avg(
     trading_dates_set = None
     if day_type == "交易日" and trading_days_df is not None:
         trading_dates_set = set(trading_days_df[trading_days_df["IS_TRD_DT"] == True]["CALD_DATE"].values)
+        if trading_dates_sorted_np is None:
+            trading_dates_sorted_np = _sorted_trading_dates_np(trading_dates_set)
+    idx_nav_np = idx_df["NAV_DT"].to_numpy(dtype="datetime64[ns]")
     group_to_indices = result.groupby(["产品类型", "周期", "计算基准日"]).groups
 
     for metric in metrics:
@@ -967,16 +1102,18 @@ def build_benchmark_and_avg(
         if pd.isna(idx_start_dt) or pd.isna(idx_end_dt):
             continue
 
-        idx_sub = idx_df[
-            (idx_df["NAV_DT"] >= idx_start_dt) &
-            (idx_df["NAV_DT"] <= idx_end_dt)
-            ]
-        
+        s_np = _to_np_datetime64(idx_start_dt)
+        e_np = _to_np_datetime64(idx_end_dt)
+        i0 = np.searchsorted(idx_nav_np, s_np, side="left")
+        i1 = np.searchsorted(idx_nav_np, e_np, side="right")
+        idx_sub = idx_df.iloc[i0:i1]
+
         hs300_metrics = _calc_hs300_metrics_for_row(
             idx_sub=idx_sub,
             day_type=day_type,
             trading_days_df=trading_days_df,
             trading_dates_set=trading_dates_set,
+            trading_dates_sorted_np=trading_dates_sorted_np,
         )
         for metric_name, metric_value in hs300_metrics.items():
             result.loc[idx, metric_name] = metric_value
@@ -1050,22 +1187,49 @@ def rank_by_established_date(df: pd.DataFrame, product_base_info: pd.DataFrame) 
     return df
 
 
+def _calc_product_worker_pack(payload):
+    (
+        prd_group,
+        idx_df,
+        periods,
+        fund_established_dt,
+        day_type,
+        trading_days_df,
+        trading_dates_set,
+        trading_dates_sorted_np,
+    ) = payload
+    return calc_product_metrics(
+        prd_group,
+        idx_df,
+        periods,
+        fund_established_dt,
+        day_type,
+        trading_days_df,
+        trading_dates_set,
+        trading_dates_sorted_np,
+    )
+
+
 # --------------------------------------------------
 # 9. 主流程
 # --------------------------------------------------
 def main(index_secu_id="000300.IDX.CSIDX", day_type="交易日"):
+    t_main = time.perf_counter()
     periods = ["近 1 年", "近 2 年", "近 3 年", "近 5 年", "今年以来", "成立以来"]
 
     prd_df = fetch_fin_prd_nav()
     idx_df = fetch_index_quote(index_secu_id)
+    idx_df = idx_df.sort_values("NAV_DT", ignore_index=True)
     product_base_info = fetch_product_base_info()
 
     # 获取交易日数据（仅当day_type为交易日时）
     trading_days_df = None
     trading_dates_set = None
+    trading_dates_sorted_np = None
     if day_type == "交易日":
         trading_days_df = fetch_trading_days()
         trading_dates_set = set(trading_days_df[trading_days_df["IS_TRD_DT"] == True]["CALD_DATE"].values)
+        trading_dates_sorted_np = _sorted_trading_dates_np(trading_dates_set)
 
     # ========== 产品类型填充 ==========
     prd_df = fill_special_prd_typ(prd_df, product_base_info)
@@ -1079,33 +1243,35 @@ def main(index_secu_id="000300.IDX.CSIDX", day_type="交易日"):
 
     grouped_products = list(prd_df.groupby("PRD_CODE"))
     max_workers = min(8, max(1, (os.cpu_count() or 4)))
-    future_list = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for prd_code, g in grouped_products:
-            fund_established_dt = established_dt_map.get(prd_code, pd.NaT)
-            if pd.isna(fund_established_dt):
-                future_list.append(None)
-                continue
-            future = executor.submit(
-                calc_product_metrics,
+    payloads = []
+    for prd_code, g in grouped_products:
+        fund_established_dt = established_dt_map.get(prd_code, pd.NaT)
+        if pd.isna(fund_established_dt):
+            continue
+        payloads.append(
+            (
                 g,
                 idx_df,
                 periods,
                 fund_established_dt,
                 day_type,
                 trading_days_df,
-                trading_dates_set
+                trading_dates_set,
+                trading_dates_sorted_np,
             )
-            future_list.append(future)
+        )
 
-        all_results = []
-        for future in future_list:
-            if future is None:
-                continue
-            all_results.extend(future.result())
+    all_results = []
+    chunksize = max(1, len(payloads) // (max_workers * 4) or 1)
+    ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+        for part in executor.map(_calc_product_worker_pack, payloads, chunksize=chunksize):
+            all_results.extend(part)
 
     df = pd.DataFrame(all_results)
-    df_rank = build_benchmark_and_avg(df, idx_df, product_base_info, day_type, trading_days_df)
+    df_rank = build_benchmark_and_avg(
+        df, idx_df, product_base_info, day_type, trading_days_df, trading_dates_sorted_np
+    )
     df_rank = rank_by_established_date(df_rank, product_base_info)
 
     # ========== 产品指标 → 指数指标 → 同类平均指标 → 排名 ==========
@@ -1144,6 +1310,7 @@ def main(index_secu_id="000300.IDX.CSIDX", day_type="交易日"):
 
     df_rank = df_rank.where(pd.notna(df_rank), "--")
 
+    print(f"[计时] main() 总耗时: {time.perf_counter() - t_main:.2f} 秒（perf_counter）", flush=True)
     return df_rank
 
 
@@ -1151,15 +1318,17 @@ def main(index_secu_id="000300.IDX.CSIDX", day_type="交易日"):
 # 10. 执行入口
 # --------------------------------------------------
 if __name__ == "__main__":
+    mp.freeze_support()
+    t_script = time.perf_counter()
     print("开始计算收益能力指标...")
-    result = main(day_type="自然日")
+    result = main(day_type="交易日")
 
     if result is not None and len(result) > 0:
         print(f"\n计算完成！共 {len(result)} 条记录")
-        print("\n前10条数据预览：")
-        print(result.head(10).to_string())
 
         result.to_csv("收益能力指标.csv", index=False, encoding="utf-8-sig", quoting=1)
         print("\n💾 结果已保存至：收益能力指标.csv")
     else:
         print("\n⚠️ 警告：没有计算出任何数据！")
+
+    print(f"[计时] 脚本总耗时（含 CSV 写入）: {time.perf_counter() - t_script:.2f} 秒（perf_counter）", flush=True)
