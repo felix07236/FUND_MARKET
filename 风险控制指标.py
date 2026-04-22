@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from datetime import timedelta
 from dateutil.relativedelta import relativedelta
+import time
 
 # --------------------------------------------------
 # 1. 数据库连接
@@ -128,6 +129,66 @@ def _filter_daily_ret_by_trading_days(ret: pd.Series, trading_days_df: pd.DataFr
     ).dt.normalize().unique()
     ix = pd.DatetimeIndex(ret.index).normalize()
     return ret.loc[ix.isin(td_idx)]
+
+
+def _resolve_actual_theoretical_start(
+        period: str,
+        fund_established_dt: pd.Timestamp,
+        theoretical_start_dt: pd.Timestamp,
+        day_type: str,
+        trading_days_df: pd.DataFrame = None,
+) -> pd.Timestamp:
+    """与「收益能力指标」一致：交易日起点为理论起点当日或之前最近交易日。成立以来为成立日。"""
+    if _normalize_period_key(period) == "成立以来":
+        return fund_established_dt
+
+    if day_type == "交易日" and trading_days_df is not None:
+        trading_dates_sorted = trading_days_df[trading_days_df["IS_TRD_DT"] == True]["CALD_DATE"].sort_values()
+        prev_trading_days = trading_dates_sorted[trading_dates_sorted <= theoretical_start_dt]
+        if len(prev_trading_days) > 0:
+            return prev_trading_days.max()
+    return theoretical_start_dt
+
+
+def _has_missing_data_in_period(
+        nav_df: pd.DataFrame,
+        start_dt: pd.Timestamp,
+        end_dt: pd.Timestamp,
+        day_type: str = "自然日",
+        trading_days_df: pd.DataFrame = None,
+) -> bool:
+    """
+    与「收益能力指标」一致：从 start_dt 到 end_dt 内，自然日需逐日有净值，交易日需每个交易日有净值，否则视为缺失。
+    """
+    period_nav = nav_df[(nav_df["NAV_DT"] >= start_dt) & (nav_df["NAV_DT"] <= end_dt)].copy()
+    if period_nav.empty:
+        return True
+
+    actual_dates = set(period_nav["NAV_DT"].dropna().unique())
+    if day_type == "交易日" and trading_days_df is not None:
+        expected_dates = set(
+            trading_days_df[
+                (trading_days_df["IS_TRD_DT"] == True) &
+                (trading_days_df["CALD_DATE"] >= start_dt) &
+                (trading_days_df["CALD_DATE"] <= end_dt)
+            ]["CALD_DATE"].unique()
+        )
+    else:
+        expected_dates = set(pd.date_range(start=start_dt, end=end_dt, freq="D"))
+
+    return len(expected_dates - actual_dates) > 0
+
+
+def _empty_risk_metrics_result(period: str) -> dict:
+    return {
+        "周期": period,
+        "最大回撤": np.nan,
+        "贝塔": np.nan,
+        "回撤修复": np.nan,
+        "年化波动率": np.nan,
+        "下行风险": np.nan,
+        "防守能力": np.nan,
+    }
 
 
 def _apply_day_type_to_fund_idx_returns(
@@ -270,6 +331,32 @@ def calc_risk_metrics(
     fund_established_dt = get_fund_established_dt(prd_df, df_base_info)
 
     theory_start_dt, period_end_dt = get_period_dates_for_drawdown(base_dt, period, idx_df)
+
+    prd_df_clean = prd_df
+    if pd.notna(fund_established_dt):
+        prd_df_clean = prd_df[prd_df["NAV_DT"] >= fund_established_dt].copy()
+    if prd_df_clean.empty:
+        return _empty_risk_metrics_result(period)
+
+    actual_theoretical_start = _resolve_actual_theoretical_start(
+        period, fund_established_dt, theory_start_dt, day_type, trading_days_df
+    )
+    pnorm = _normalize_period_key(period)
+    if pnorm != "成立以来":
+        ats = pd.Timestamp(actual_theoretical_start).normalize()
+        if prd_df_clean[prd_df_clean["NAV_DT"].dt.normalize() == ats].empty:
+            return _empty_risk_metrics_result(period)
+
+    missing_check_start_dt = fund_established_dt if pnorm == "成立以来" else actual_theoretical_start
+    if _has_missing_data_in_period(
+            nav_df=prd_df_clean,
+            start_dt=missing_check_start_dt,
+            end_dt=period_end_dt,
+            day_type=day_type,
+            trading_days_df=trading_days_df,
+    ):
+        return _empty_risk_metrics_result(period)
+
     nav_start = get_nav_start(prd_df, theory_start_dt, fund_established_dt)
     nav_end = get_nav_end(prd_df, period_end_dt)
 
@@ -280,26 +367,10 @@ def calc_risk_metrics(
         ].copy()
 
     if len(sub) < 2:
-        return {
-            "周期": period,
-            "最大回撤": np.nan,
-            "贝塔": np.nan,
-            "回撤修复": np.nan,
-            "年化波动率": np.nan,
-            "下行风险": np.nan,
-            "防守能力": np.nan
-        }
+        return _empty_risk_metrics_result(period)
 
     if pd.isna(nav_start) or pd.isna(nav_end) or nav_start <= 0:
-        return {
-            "周期": period,
-            "最大回撤": np.nan,
-            "贝塔": np.nan,
-            "回撤修复": np.nan,
-            "年化波动率": np.nan,
-            "下行风险": np.nan,
-            "防守能力": np.nan
-        }
+        return _empty_risk_metrics_result(period)
 
     # 区间内日收益率（与 UNIT_NVAL 区间序列一致）
     sub["日收益"] = sub["UNIT_NVAL"].pct_change()
@@ -485,102 +556,191 @@ def calc_product_risk_metrics(
     return results
 
 
+def _normalize_timestamp(ts):
+    if pd.isna(ts):
+        return pd.NaT
+    return pd.to_datetime(ts)
+
+
+RISK_BENCHMARK_METRICS = [
+    "最大回撤", "贝塔", "回撤修复", "年化波动率", "下行风险", "防守能力",
+]
+
+
+def _is_risk_comparable_for_benchmark(
+        comp_row: pd.Series,
+        target_row: pd.Series,
+        established_dt_map: dict,
+) -> bool:
+    """
+    与「收益能力指标」_is_product_eligible_for_row 一致：可比的成立日规则；
+    本模块使用「理论起始日」、周期归一与「产品类型+周期+计算模式+计算基准日」已分组后的候选行。
+    """
+    comp_prd = comp_row["产品代码"]
+    if established_dt_map is None or not established_dt_map:
+        return False
+    comp_est = established_dt_map.get(comp_prd, pd.NaT)
+    if pd.isna(comp_est):
+        return False
+    comp_est = _normalize_timestamp(comp_est)
+    period = target_row["周期"]
+    pnorm = _normalize_period_key(period)
+    if pnorm == "成立以来":
+        target_prd = target_row["产品代码"]
+        t_est = established_dt_map.get(target_prd, pd.NaT)
+        t_est = _normalize_timestamp(t_est)
+        if pd.isna(t_est):
+            return False
+        return comp_est <= t_est
+    target_theory = _normalize_timestamp(target_row.get("理论起始日", pd.NaT))
+    if pd.isna(target_theory):
+        return False
+    return comp_est <= target_theory
+
+
+def _get_risk_comparable_for_benchmark(
+        df: pd.DataFrame,
+        target_row: pd.Series,
+        established_dt_map: dict,
+        candidate_indices: list,
+) -> list:
+    out = []
+    for comp_idx in candidate_indices:
+        comp_row = df.loc[comp_idx]
+        if not comp_row.get("符合条件", True):
+            continue
+        if comp_row.get("产品类型") == "指数":
+            continue
+        if _is_risk_comparable_for_benchmark(comp_row, target_row, established_dt_map):
+            out.append(comp_idx)
+    return out
+
+
+def _calc_hs300_risk_for_row_slice(
+        idx_sub: pd.DataFrame,
+        idx_start: float,
+        day_type: str,
+        trading_days_df: pd.DataFrame = None,
+) -> dict:
+    """
+    与原先「沪深 300」基准行计算口径一致：区间自理论起点起归一的回撤、
+    日收益按计算模式取年化波动率/下行风险；贝塔=1、防守=1、回撤修复需要计算。
+    """
+    if len(idx_sub) < 2:
+        return {m: np.nan for m in RISK_BENCHMARK_METRICS}
+    idx_sub = idx_sub.sort_values("NAV_DT").copy()
+    idx_cum = idx_sub["INDEX_CLOSE"] / idx_start
+    idx_max_dd = max_drawdown(idx_cum)
+    
+    # ========== 计算回撤修复时间 ==========
+    idx_sub["历史最高"] = idx_cum.cummax()
+    idx_sub["回撤"] = (idx_cum - idx_sub["历史最高"]) / idx_sub["历史最高"]
+    
+    significant_drawdowns = idx_sub[idx_sub["回撤"] < -0.01].copy()
+    
+    if len(significant_drawdowns) == 0:
+        recovery_time = np.nan
+    else:
+        recovery_days = []
+        for idx_pos, row in significant_drawdowns.iterrows():
+            future = idx_sub[idx_sub["NAV_DT"] >= row["NAV_DT"]].copy()
+            recovered = future[future["INDEX_CLOSE"] / idx_start >= row["历史最高"]]
+            if len(recovered) > 0:
+                days = (recovered.iloc[0]["NAV_DT"] - row["NAV_DT"]).days
+                recovery_days.append(days)
+        recovery_time = np.mean(recovery_days) if recovery_days else np.nan
+    
+    idx_daily_ret = idx_sub.set_index("NAV_DT")["INDEX_CLOSE"].pct_change().dropna()
+    if day_type == "交易日" and trading_days_df is not None:
+        idx_daily_ret = _filter_daily_ret_by_trading_days(idx_daily_ret, trading_days_df)
+    ann_scale = _vol_annual_factor(day_type)
+    idx_vol = idx_daily_ret.std() * ann_scale if len(idx_daily_ret) >= 2 else np.nan
+    idx_neg = idx_daily_ret[idx_daily_ret < 0]
+    idx_down_risk = idx_neg.std() * ann_scale if len(idx_neg) >= 2 else np.nan
+    return {
+        "最大回撤": idx_max_dd,
+        "贝塔": 1.0,
+        "回撤修复": recovery_time,
+        "年化波动率": idx_vol,
+        "下行风险": idx_down_risk,
+        "防守能力": 1.0,
+    }
+
+
 # --------------------------------------------------
-# 7. 同类平均 & 沪深 300（基于全部产品）
+# 7. 同类平均 & 沪深 300 列（与「收益能力指标」build_benchmark_and_avg 一致：逐行补列，不另增汇总行）
 # --------------------------------------------------
 def build_benchmark_and_avg(
         df: pd.DataFrame,
         idx_df: pd.DataFrame,
-        periods: list,
+        product_base_info: pd.DataFrame,
         trading_days_df: pd.DataFrame = None,
 ) -> pd.DataFrame:
-    rows = []
-    bench_base_dt = pd.Timestamp(idx_df["NAV_DT"].max()).normalize()
+    result = df.reset_index(drop=True)
+    for c in RISK_BENCHMARK_METRICS:
+        for prefix in ("同类平均", "沪深300"):
+            result[f"{prefix}{c}"] = np.nan
 
-    # 计算同类平均
-    group_cols = ["产品类型", "周期", "计算模式"]
-    prod_df = df[df["产品代码"] != "同类平均"].copy()
-    if "符合条件" in prod_df.columns:
-        prod_df = prod_df[prod_df["符合条件"] == True]
-
-    for key, g in prod_df.groupby(group_cols):
-        typ, period, _mode = key
-        if typ == "指数":
-            continue
-
-        risk_cols = ["最大回撤", "贝塔", "年化波动率", "下行风险", "防守能力"]
-
-        row = {
-            "产品代码": "同类平均",
-            "产品类型": typ,
-            "周期": period,
-            "计算模式": _mode,
-            "计算基准日": bench_base_dt,
-            "成立日": pd.NaT,
-            "理论起始日": pd.NaT,
-            "符合条件": False,
-        }
-
-        for col in risk_cols:
-            row[col] = g[col].mean()
-
-        # 回撤修复时间取中位数
-        row["回撤修复"] = g["回撤修复"].median()
-
-        rows.append(row)
-
-    # 计算沪深 300 基准（最大回撤与区间价格一致；波动率按各「计算模式」过滤与年化）
-    base_dt = idx_df["NAV_DT"].max()
-    if "计算模式" in df.columns and df["计算模式"].notna().any():
-        modes = sorted(df["计算模式"].dropna().unique().tolist())
+    if product_base_info is not None and len(product_base_info) > 0:
+        established_dt_map = (
+            product_base_info.dropna(subset=["PRD_CODE"])
+            .drop_duplicates(subset=["PRD_CODE"], keep="first")
+            .set_index("PRD_CODE")["FOUND_DT"]
+            .to_dict()
+        )
     else:
-        modes = ["交易日"]
+        established_dt_map = {}
 
-    for period in periods:
+    group_to_indices = result.groupby(
+        ["产品类型", "周期", "计算模式", "计算基准日"]
+    ).groups
+
+    for row_idx, row in result.iterrows():
+        gkey = (
+            row.get("产品类型"),
+            row.get("周期"),
+            row.get("计算模式"),
+            row.get("计算基准日"),
+        )
+        if gkey[0] is None or gkey[1] is None or gkey[2] is None or pd.isna(gkey[3]):
+            continue
+        candidate_indices = list(group_to_indices.get(gkey, []))
+        comp_ix = _get_risk_comparable_for_benchmark(
+            result, row, established_dt_map, candidate_indices
+        )
+        if len(comp_ix) > 0:
+            comp_df = result.loc[comp_ix]
+            for m in RISK_BENCHMARK_METRICS:
+                coln = f"同类平均{m}"
+                if m == "回撤修复":
+                    result.at[row_idx, coln] = comp_df[m].median()
+                else:
+                    result.at[row_idx, coln] = comp_df[m].mean()
+
+        base_dt = row.get("计算基准日")
+        period = row.get("周期")
+        day_type = row.get("计算模式", "交易日")
+        if pd.isna(base_dt):
+            continue
+        base_dt = pd.Timestamp(base_dt)
         theory_start_dt, period_end_dt = get_period_dates_for_drawdown(base_dt, period, idx_df)
         idx_start = get_index_start_price(idx_df, theory_start_dt)
         if pd.isna(idx_start) or idx_start <= 0:
             continue
-
         idx_sub = idx_df[
             (idx_df["NAV_DT"] >= theory_start_dt) &
             (idx_df["NAV_DT"] <= period_end_dt)
-            ].sort_values("NAV_DT")
-
+        ].sort_values("NAV_DT")
         if len(idx_sub) < 2:
             continue
+        td = trading_days_df if str(day_type) == "交易日" else None
+        slice_metrics = _calc_hs300_risk_for_row_slice(
+            idx_sub, float(idx_start), str(day_type), td
+        )
+        for m, val in slice_metrics.items():
+            result.at[row_idx, f"沪深300{m}"] = val
 
-        idx_sub = idx_sub.copy()
-        idx_cum = idx_sub["INDEX_CLOSE"] / idx_start
-        idx_max_dd = max_drawdown(idx_cum)
-
-        for mode in modes:
-            idx_daily_ret = idx_sub.set_index("NAV_DT")["INDEX_CLOSE"].pct_change().dropna()
-            if mode == "交易日" and trading_days_df is not None:
-                idx_daily_ret = _filter_daily_ret_by_trading_days(idx_daily_ret, trading_days_df)
-            ann_scale = _vol_annual_factor(mode)
-            idx_vol = idx_daily_ret.std() * ann_scale if len(idx_daily_ret) >= 2 else np.nan
-            idx_neg = idx_daily_ret[idx_daily_ret < 0]
-            idx_down_risk = idx_neg.std() * ann_scale if len(idx_neg) >= 2 else np.nan
-
-            rows.append({
-                "产品代码": "沪深 300",
-                "产品类型": "指数",
-                "周期": period,
-                "计算模式": mode,
-                "计算基准日": bench_base_dt,
-                "成立日": pd.NaT,
-                "理论起始日": pd.NaT,
-                "符合条件": False,
-                "最大回撤": idx_max_dd,
-                "贝塔": 1.0,  # 指数的 Beta 为 1
-                "回撤修复": np.nan,
-                "年化波动率": idx_vol,
-                "下行风险": idx_down_risk,
-                "防守能力": 1.0  # 指数自身作为基准
-            })
-
-    return pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
+    return result
 
 
 # --------------------------------------------------
@@ -664,28 +824,42 @@ def format_output(df: pd.DataFrame) -> pd.DataFrame:
         if _c in df_copy.columns:
             df_copy = df_copy.drop(columns=[_c])
 
-    # 百分比格式
+    # 百分比格式（与「收益能力指标」一致：无值处保持 NaN，最后统一为 --）
     pct_cols = ["最大回撤", "贝塔", "年化波动率", "下行风险", "防守能力"]
     for col in pct_cols:
         if col in df_copy.columns:
             df_copy[col] = df_copy[col].apply(
-                lambda x: f"{x:.2%}" if pd.notna(x) else ""
+                lambda x: f"{x:.2%}" if pd.notna(x) else x
             )
+
+    for pfx in ("同类平均", "沪深300"):
+        for col in RISK_BENCHMARK_METRICS:
+            name = f"{pfx}{col}"
+            if name not in df_copy.columns:
+                continue
+            if col in ("最大回撤", "贝塔", "年化波动率", "下行风险", "防守能力"):
+                df_copy[name] = df_copy[name].apply(
+                    lambda x: f"{x:.2%}" if pd.notna(x) else x
+                )
+            elif col == "回撤修复":
+                df_copy[name] = df_copy[name].apply(
+                    lambda x: f"{int(x)}天" if pd.notna(x) else x
+                )
 
     # 回撤修复时间为整数
     if "回撤修复" in df_copy.columns:
         df_copy["回撤修复"] = df_copy["回撤修复"].apply(
-            lambda x: f"{int(x)}天" if pd.notna(x) else ""
+            lambda x: f"{int(x)}天" if pd.notna(x) else x
         )
 
     rank_cols = ["最大回撤排名", "贝塔排名", "回撤修复排名", "年化波动率排名", "下行风险排名", "防守能力排名"]
     for col in rank_cols:
         if col in df_copy.columns:
             df_copy[col] = df_copy[col].apply(
-                lambda x: f"{x}名" if pd.notna(x) and x != "" else ""
+                lambda x: f"{x}名" if pd.notna(x) and x != "" else x
             )
 
-    return df_copy
+    return df_copy.where(pd.notna(df_copy), "--")
 
 
 
@@ -720,11 +894,20 @@ def main(index_secu_id="000300.IDX.CSIDX", day_type="交易日"):
 
     df = pd.DataFrame(all_results)
 
-    # 添加同类平均和沪深 300
-    df_rank = build_benchmark_and_avg(df, idx_df, periods, trading_days_df)
+    # 为每行补充「同类平均*」「沪深300*」列（与「收益能力指标」一致，不另增同类/指数汇总行）
+    df_rank = build_benchmark_and_avg(df, idx_df, df_base_info, trading_days_df)
 
     # 排名
     df_rank = rank_risk_df(df_rank)
+
+    _col_order = (
+        ["产品代码", "产品类型", "计算模式", "周期", "计算基准日", "成立日", "理论起始日", "符合条件"]
+        + RISK_BENCHMARK_METRICS
+        + [f"同类平均{m}" for m in RISK_BENCHMARK_METRICS]
+        + [f"沪深300{m}" for m in RISK_BENCHMARK_METRICS]
+        + [f"{c}排名" for c in RISK_BENCHMARK_METRICS]
+    )
+    df_rank = df_rank[[c for c in _col_order if c in df_rank.columns]]
 
     # 格式化输出
     df_formatted = format_output(df_rank)
@@ -736,6 +919,12 @@ def main(index_secu_id="000300.IDX.CSIDX", day_type="交易日"):
 # 11. 执行入口
 # --------------------------------------------------
 if __name__ == "__main__":
+    start_time = time.time()
+    
     result = main()
     result.to_csv("风险控制指标.csv", index=False, encoding="utf-8-sig")
     print(result.head())
+    
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"\n⏱️ 程序运行时间: {elapsed_time:.2f} 秒")
