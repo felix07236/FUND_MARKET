@@ -213,28 +213,49 @@ def _empty_risk_metrics_result(period: str) -> dict:
     }
 
 
-def _mean_recovery_days_vectorized(
+def _max_drawdown_recovery_days(
         nav_dt: np.ndarray,
-        cum_ret: np.ndarray,
-        drawdown: np.ndarray,
-        hist_peak: np.ndarray,
-        thresh: float = -0.01,
+        navs: np.ndarray,
 ) -> float:
-    """显著回撤点（回撤 < thresh）至累计收益重新触及该点「历史最高」的平均自然日修复天数。"""
-    sig = drawdown < thresh
-    if not np.any(sig):
+    """
+    回撤修复口径与 Excel 公式一致：
+    1) 先按 runningMax 计算全区间 drawdown；
+    2) 仅取「最大回撤」所在谷点 trough；
+    3) 从 trough 之后找首次恢复到 trough 对应峰值(peak)的日期；
+    4) 返回 recovery_date - trough_date 的自然日天数；无恢复则 NaN。
+    """
+    if nav_dt is None or navs is None:
         return np.nan
-    days_list = []
-    for pos in np.flatnonzero(sig):
-        target_peak = hist_peak[pos]
-        tail = cum_ret[pos:]
-        mask = tail >= target_peak
-        if not np.any(mask):
-            continue
-        j = pos + int(np.flatnonzero(mask)[0])
-        d = (pd.Timestamp(nav_dt[j]) - pd.Timestamp(nav_dt[pos])).days
-        days_list.append(d)
-    return float(np.mean(days_list)) if days_list else np.nan
+    if len(nav_dt) < 2 or len(navs) < 2:
+        return np.nan
+
+    navs = np.asarray(navs, dtype=float)
+    running_max = np.maximum.accumulate(navs)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        drawdown = (running_max - navs) / running_max
+
+    if not np.isfinite(drawdown).any():
+        return np.nan
+    max_dd = np.nanmax(drawdown)
+    if (not np.isfinite(max_dd)) or max_dd <= 0:
+        return np.nan
+
+    trough_candidates = np.flatnonzero(np.isclose(drawdown, max_dd, rtol=1e-12, atol=1e-12))
+    if len(trough_candidates) == 0:
+        return np.nan
+    trough_pos = int(trough_candidates[0])
+
+    if trough_pos >= len(navs) - 1:
+        return np.nan
+
+    target_nav = running_max[trough_pos]
+    tail = navs[trough_pos + 1:]
+    recovery_candidates = np.flatnonzero(tail >= target_nav)
+    if len(recovery_candidates) == 0:
+        return np.nan
+
+    recovery_pos = trough_pos + 1 + int(recovery_candidates[0])
+    return float((pd.Timestamp(nav_dt[recovery_pos]) - pd.Timestamp(nav_dt[trough_pos])).days)
 
 
 def _apply_day_type_to_fund_idx_returns(
@@ -375,8 +396,13 @@ def calc_risk_metrics(
     prd_df = prd_df.sort_values("NAV_DT")
     base_dt = prd_df["NAV_DT"].max()
     fund_established_dt = get_fund_established_dt(prd_df, df_base_info)
-
+    pnorm = _normalize_period_key(period)
     theory_start_dt, period_end_dt = get_period_dates_for_drawdown(base_dt, period, idx_df)
+    if pnorm == "成立以来":
+        if pd.isna(fund_established_dt):
+            return _empty_risk_metrics_result(period)
+        theory_start_dt = pd.Timestamp(fund_established_dt).normalize() - pd.Timedelta(days=1)
+        period_end_dt = base_dt
 
     prd_df_clean = prd_df
     if pd.notna(fund_established_dt):
@@ -387,23 +413,29 @@ def calc_risk_metrics(
     actual_theoretical_start = _resolve_actual_theoretical_start(
         period, fund_established_dt, theory_start_dt, day_type, trading_days_df
     )
-    pnorm = _normalize_period_key(period)
+    if pnorm == "成立以来":
+        # 成立以来固定使用「成立日前一天」作为虚拟起点，产品起始净值按 1 处理
+        actual_theoretical_start = theory_start_dt
+    
     if pnorm != "成立以来":
         ats = pd.Timestamp(actual_theoretical_start).normalize()
         if prd_df_clean[prd_df_clean["NAV_DT"].dt.normalize() == ats].empty:
             return _empty_risk_metrics_result(period)
 
     missing_check_start_dt = fund_established_dt if pnorm == "成立以来" else actual_theoretical_start
-    if _has_missing_data_in_period(
+    has_missing = _has_missing_data_in_period(
             nav_df=prd_df_clean,
             start_dt=missing_check_start_dt,
             end_dt=period_end_dt,
             day_type=day_type,
             trading_days_df=trading_days_df,
-    ):
+    )
+    if has_missing:
         return _empty_risk_metrics_result(period)
 
     nav_start = get_nav_start(prd_df, theory_start_dt, fund_established_dt)
+    if pnorm == "成立以来":
+        nav_start = 1.0
     nav_end = get_nav_end(prd_df, period_end_dt)
 
     actual_start_dt = max(theory_start_dt, fund_established_dt)
@@ -421,6 +453,7 @@ def calc_risk_metrics(
     # 基金日收益只算一次（虚拟起始点与贝塔/波动率共用）
     fund_nav_series = sub.set_index("NAV_DT")["UNIT_NVAL"]
     has_virtual_start = (theory_start_dt < fund_established_dt) and (nav_start == 1.0)
+
     if has_virtual_start and len(fund_nav_series) > 0:
         first_date = fund_nav_series.index[0]
         first_nav = fund_nav_series.iloc[0]
@@ -445,7 +478,7 @@ def calc_risk_metrics(
 
     # ==========  贝塔  ==========
     idx_sub = idx_df[
-        (idx_df["NAV_DT"] >= sub["NAV_DT"].min()) &
+        (idx_df["NAV_DT"] >= theory_start_dt) &
         (idx_df["NAV_DT"] <= base_dt)
         ].copy()
 
@@ -487,11 +520,11 @@ def calc_risk_metrics(
     # ==========  回撤修复时间  ==========
     nav_a = sub["NAV_DT"].to_numpy()
     cum_a = sub["累计收益"].to_numpy(dtype=float)
-    dd_a = sub["回撤"].to_numpy(dtype=float)
-    peak_a = sub["历史最高"].to_numpy(dtype=float)
-    recovery_time = _mean_recovery_days_vectorized(nav_a, cum_a, dd_a, peak_a, thresh=-0.01)
+    recovery_time = _max_drawdown_recovery_days(nav_a, cum_a)
 
-    # ========== 防守能力  ==========
+    # ========== 防守能力 ==========
+    # 公式：|基金在所有市场下跌日的平均收益| / |市场平均跌幅|
+    # 值越小表示防守能力越强（基金跌得比市场少）
     if merged_valid is None or len(merged_valid) < 10:
         defensive_ability = np.nan
     else:
@@ -499,14 +532,16 @@ def calc_risk_metrics(
         if down_mask.sum() < 5:
             defensive_ability = np.nan
         else:
-            avg_fund_drop = abs(np.nanmean(merged_valid["日收益"].to_numpy(dtype=float)[down_mask]))
-            avg_market_drop = abs(np.nanmean(merged_valid["指数日收益"].to_numpy(dtype=float)[down_mask]))
-
+            avg_fund_return = np.nanmean(merged_valid["日收益"].to_numpy(dtype=float)[down_mask])
+            avg_market_return = np.nanmean(merged_valid["指数日收益"].to_numpy(dtype=float)[down_mask])
+    
+            avg_fund_drop = abs(avg_fund_return)
+            avg_market_drop = abs(avg_market_return)
+    
             if avg_market_drop != 0:
-                defensive_ability = 1 - (avg_fund_drop / avg_market_drop)
+                defensive_ability = avg_fund_drop / avg_market_drop
             else:
                 defensive_ability = np.nan
-
     return {
         "周期": period,
         "最大回撤": max_dd_val,
@@ -546,6 +581,8 @@ def calc_product_risk_metrics(
     for period in periods:
         cal_theory, _ = get_period_dates_for_drawdown(base_dt, period, idx_df)
         cal_theory = pd.Timestamp(cal_theory).normalize()
+        if _normalize_period_key(period) == "成立以来" and pd.notna(fund_est):
+            cal_theory = pd.Timestamp(fund_est).normalize() - pd.Timedelta(days=1)
         if _normalize_period_key(period) == "成立以来":
             admission_start = fund_est
         else:
@@ -647,10 +684,8 @@ def _calc_hs300_risk_for_row_slice(
     idx_cum = (idx_sub["INDEX_CLOSE"] / idx_start).to_numpy(dtype=float)
     idx_max_dd = max_drawdown(pd.Series(idx_cum))
 
-    idx_hist = pd.Series(idx_cum).cummax().to_numpy(dtype=float)
-    idx_dd = (idx_cum - idx_hist) / idx_hist
     nav_a = idx_sub["NAV_DT"].to_numpy()
-    recovery_time = _mean_recovery_days_vectorized(nav_a, idx_cum, idx_dd, idx_hist, thresh=-0.01)
+    recovery_time = _max_drawdown_recovery_days(nav_a, idx_cum)
 
     idx_daily_ret = idx_sub.set_index("NAV_DT")["INDEX_CLOSE"].pct_change().dropna()
     if day_type == "交易日" and trading_days_df is not None:
@@ -722,6 +757,10 @@ def build_benchmark_and_avg(
             continue
         base_dt_ts = pd.Timestamp(base_dt_row)
         theory_start_dt, period_end_dt = get_period_dates_for_drawdown(base_dt_ts, period, idx_df)
+        if _normalize_period_key(str(period)) == "成立以来":
+            fund_est_row = row.get("成立日", pd.NaT)
+            if pd.notna(fund_est_row):
+                theory_start_dt = pd.Timestamp(fund_est_row).normalize() - pd.Timedelta(days=1)
         idx_start = get_index_start_price(idx_df, theory_start_dt)
         if pd.isna(idx_start) or idx_start <= 0:
             continue
@@ -749,8 +788,8 @@ def rank_risk_df(df: pd.DataFrame) -> pd.DataFrame:
     if "计算模式" not in df.columns:
         df["计算模式"] = "交易日"
 
-    smaller_is_better = ["最大回撤", "贝塔", "回撤修复", "年化波动率", "下行风险"]
-    larger_is_better = ["防守能力"]
+    smaller_is_better = ["最大回撤", "贝塔", "回撤修复", "年化波动率", "下行风险", "防守能力"]
+    larger_is_better = []
 
     for col in smaller_is_better + larger_is_better:
         df[f"{col}排名"] = np.nan
@@ -814,12 +853,6 @@ def rank_risk_df(df: pd.DataFrame) -> pd.DataFrame:
             my = rk.loc[idx] if idx in rk.index else np.nan
             if pd.notna(my):
                 df.at[idx, f"{col}排名"] = f"{int(my)}/{total_count}"
-
-        col = "防守能力"
-        rk = comparable_df[col].rank(method="min", ascending=False, na_option="keep")
-        my = rk.loc[idx] if idx in rk.index else np.nan
-        if pd.notna(my):
-            df.at[idx, f"{col}排名"] = f"{int(my)}/{total_count}"
 
     return df
 
