@@ -852,7 +852,9 @@ def rank_risk_df(df: pd.DataFrame) -> pd.DataFrame:
             rk = comparable_df[col].rank(method="min", ascending=True, na_option="keep")
             my = rk.loc[idx] if idx in rk.index else np.nan
             if pd.notna(my):
-                df.at[idx, f"{col}排名"] = f"{int(my)}/{total_count}"
+                # 分母只包含有有效数值的产品
+                valid_count = comparable_df[col].notna().sum()
+                df.at[idx, f"{col}排名"] = f"{int(my)}/{valid_count}"
 
     return df
 
