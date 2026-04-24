@@ -40,7 +40,7 @@ def fetch_fin_prd_nav(
                  NAV_ADD_RAT, \
                  AGGR_NAV_ADD_RAT
           FROM DATA_MART_04.FIN_PRD_NAV
-          WHERE AGGR_UNIT_NVAL IS NOT NULL \
+          WHERE 1=1 \
           """
     extra = []
     if nav_dt_from:
@@ -53,6 +53,9 @@ def fetch_fin_prd_nav(
         df = pd.read_sql(sql, con=conn)
 
     df["NAV_DT"] = pd.to_datetime(df["NAV_DT"].astype(str), format="%Y%m%d")
+    if "AGGR_UNIT_NVAL" in df.columns and "UNIT_NVAL" in df.columns:
+        # 与收益能力指标口径一致：累计净值缺失时回退使用单位净值
+        df["AGGR_UNIT_NVAL"] = df["AGGR_UNIT_NVAL"].fillna(df["UNIT_NVAL"])
     return df
 
 
@@ -416,7 +419,7 @@ def calc_risk_metrics(
     if pnorm == "成立以来":
         # 成立以来固定使用「成立日前一天」作为虚拟起点，产品起始净值按 1 处理
         actual_theoretical_start = theory_start_dt
-    
+
     if pnorm != "成立以来":
         ats = pd.Timestamp(actual_theoretical_start).normalize()
         if prd_df_clean[prd_df_clean["NAV_DT"].dt.normalize() == ats].empty:
@@ -788,10 +791,10 @@ def rank_risk_df(df: pd.DataFrame) -> pd.DataFrame:
     if "计算模式" not in df.columns:
         df["计算模式"] = "交易日"
 
-    smaller_is_better = ["最大回撤", "贝塔", "回撤修复", "年化波动率", "下行风险", "防守能力"]
-    larger_is_better = []
+    descending_better = ["最大回撤", "贝塔", "防守能力"]
+    ascending_better = ["回撤修复", "年化波动率", "下行风险"]
 
-    for col in smaller_is_better + larger_is_better:
+    for col in descending_better + ascending_better:
         df[f"{col}排名"] = np.nan
         df[f"{col}排名"] = df[f"{col}排名"].astype(object)
 
@@ -848,8 +851,15 @@ def rank_risk_df(df: pd.DataFrame) -> pd.DataFrame:
         comparable_df = ep.loc[comparable_indices]
         total_count = len(comparable_df)
 
-        for col in smaller_is_better:
-            rk = comparable_df[col].rank(method="min", ascending=True, na_option="keep")
+        for col in descending_better + ascending_better:
+            # 按指标特性分别使用升序或降序排名
+            if col in descending_better:
+                # 最大回撤、贝塔、防守能力: 降序排列(数值越大越好)
+                # 最大回撤是负数,-2% > -5% > -18%,降序时-2%排第1
+                rk = comparable_df[col].rank(method="min", ascending=False, na_option="keep")
+            else:
+                # 回撤修复、年化波动率、下行风险: 升序排列(数值越小越好)
+                rk = comparable_df[col].rank(method="min", ascending=True, na_option="keep")
             my = rk.loc[idx] if idx in rk.index else np.nan
             if pd.notna(my):
                 # 分母只包含有有效数值的产品
@@ -951,7 +961,7 @@ def _risk_mp_one(task):
     )
 
 
-def main(index_secu_id="000300.IDX.CSIDX", day_type="自然日"):
+def main(index_secu_id="000300.IDX.CSIDX", day_type="交易日"):
     periods = ["近 1 年", "近 2 年", "近 3 年", "近 5 年", "今年以来", "成立以来"]
     modes = ["自然日", "交易日"] if day_type is None else [day_type]
 
